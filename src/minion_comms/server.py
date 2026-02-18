@@ -1,7 +1,7 @@
-"""minion-comms MCP server — Phase 0 + Phase 1 + Phase 2.
+"""minion-comms MCP server — Phase 0 + Phase 1 + Phase 2 + Phase 3.
 
 Multi-agent coordination: messages, registration, HP tracking, context freshness,
-battle plans, and raid log.
+battle plans, raid log, and task system.
 DB: ~/.minion-comms/messages.db (override with MINION_COMMS_DB_PATH)
 """
 
