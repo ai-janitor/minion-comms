@@ -79,9 +79,54 @@ user (the human)
 - **Intel/Traps** — confirmed findings and known hazards in filesystem. Oracle must read them.
 - **Battle Journey** — agents must write up what they learned before a task can close.
 
+## Transport: Hybrid Terminal + Headless
+
+Agents connect via two transport modes on the same comms network:
+
+| Transport | Agent type | Message delivery |
+|---|---|---|
+| `terminal` | Human opens Claude Code CLI | `poll.sh` polls inbox |
+| `daemon` | [minion-swarm](https://github.com/ai-janitor/minion-swarm) spawns headless | Swarm daemon watches DB, injects on wake |
+
+Human opens terminals for high-value agents they want eyes on. Cheap work goes to swarm daemons. All peers on the same comms — same enforcement, same raid log.
+
+## Tools (36)
+
+| Phase | Tools |
+|---|---|
+| **Core Comms** | `register`, `deregister`, `rename`, `set_status`, `set_context`, `who`, `send`, `check_inbox`, `get_history`, `purge_inbox` |
+| **War Room** | `set_battle_plan`, `get_battle_plan`, `update_battle_plan_status`, `log_raid`, `get_raid_log` |
+| **Task System** | `create_task`, `assign_task`, `update_task`, `get_tasks`, `get_task`, `submit_result`, `close_task` |
+| **File Safety** | `claim_file`, `release_file`, `get_claims` |
+| **Monitoring** | `party_status`, `check_activity`, `check_freshness` |
+| **Lifecycle** | `cold_start`, `fenix_down`, `debrief`, `end_session` |
+| **Trigger Words** | `get_triggers`, `clear_moon_crash` |
+
+## Quick Start
+
+```bash
+# Install
+pip install -e .
+
+# Run MCP server (stdio transport)
+minion-comms
+
+# Or add to your .mcp.json
+{
+  "mcpServers": {
+    "minion-comms": {
+      "command": "minion-comms"
+    }
+  }
+}
+```
+
 ## Status
 
-Design phase. See [`docs/FRAMEWORK.md`](docs/FRAMEWORK.md) for the full specification.
+Server implementation complete (Phases 0-7). Docs & onboarding (Phase 8) in progress.
+
+See [`docs/FRAMEWORK.md`](docs/FRAMEWORK.md) for the full design specification.
+See [`PLAN.md`](PLAN.md) for the implementation roadmap.
 
 ## Lineage
 
