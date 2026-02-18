@@ -11,7 +11,24 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 - Python package: `minion-comms`
 - Runtime: `~/.minion-comms/` (DB, class profiles, protocol doc)
 
+## Dependency Graph
+
+```
+Phase 0 (scaffolding)
+└── Phase 1 (core comms)
+    ├── Phase 2 (war room)
+    │   └── Phase 3 (task system) ← needs battle plan enforcement
+    │       ├── Phase 5 (monitoring) ← needs tasks + claims data
+    │       └── Phase 6 (lifecycle) ← needs battle plan + tasks + raid log
+    ├── Phase 4 (file safety)
+    │   └── Phase 5 (monitoring) ← needs file claims for mtime checks
+    └── Phase 7 (trigger words) ← needs send
+Phase 8 (docs) ← can start after Phase 1, finalize after all phases
+```
+
 ## Phase 0 — Scaffolding
+
+> No dependencies. Start here.
 
 - [ ] `pyproject.toml` — package config, FastMCP dependency, entry point
 - [ ] `src/minion_comms/__init__.py`
@@ -22,6 +39,9 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 - [ ] API config: default port, localhost only
 
 ## Phase 1 — Core Comms
+
+> Blocked by: Phase 0
+
 - [ ] All tools exposed as `@mcp.tool()` via FastMCP
 - [ ] SQLite schema: agents (with `agent_class`, `model` fields), messages, broadcast_reads
 - [ ] `register` — with class validation, model whitelist enforcement, onboarding
@@ -36,6 +56,8 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 
 ## Phase 2 — War Room
 
+> Blocked by: Phase 1
+
 - [ ] `battle_plan` table with explicit statuses (active/superseded/completed/abandoned/obsolete)
 - [ ] `set_battle_plan` — lead only, enforced before send
 - [ ] `get_battle_plan`
@@ -44,6 +66,8 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 - [ ] `get_raid_log` — filter by priority, count
 
 ## Phase 3 — Task System
+
+> Blocked by: Phase 2 (battle plan enforcement on task creation)
 
 - [ ] `tasks` table: id, title, task_file, project, zone, status (full enum), blocked_by, assigned_to, created_by, files, progress, activity_count, result_file, timestamps
 - [ ] Task statuses: open, assigned, in_progress, fixed, verified, closed, abandoned, stale, obsolete
@@ -57,12 +81,16 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 
 ## Phase 4 — File Safety
 
+> Blocked by: Phase 1
+
 - [ ] `file_claims` table, `file_waitlist` table
 - [ ] `claim_file` — normalize path, block if held, auto-waitlist
 - [ ] `release_file` — auto-notify waitlist, lead can force-release
 - [ ] `get_claims` — filter by agent
 
 ## Phase 5 — Monitoring & Health
+
+> Blocked by: Phase 3, Phase 4 (needs tasks for activity counts, claims for mtime checks)
 
 - [ ] `party_status` — full raid health in one call (HP, last seen, activity count, claimed files mtime, staleness flags)
 - [ ] `check_activity` — per agent: claimed file mtime, zone mtime, last seen, last task update
@@ -73,6 +101,8 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 
 ## Phase 6 — Lifecycle
 
+> Blocked by: Phase 2, Phase 3 (cold_start needs battle plan, tasks, raid log)
+
 - [ ] `cold_start` — agent_name required, class-based briefing, returns battle plan + raid log + open tasks + agents + loot + convention file locations
 - [ ] `fenix_down` — agent lists files written, comms records manifest, staleness protection (consumed flag)
 - [ ] `debrief` — lead only, file must exist
@@ -80,11 +110,15 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 
 ## Phase 7 — Trigger Words
 
+> Blocked by: Phase 1 (needs send)
+
 - [ ] Comms recognizes trigger words in `send`: fenix_down, stand_down, sitrep, rally, retreat, moon_crash, hot_zone, recon
 - [ ] `moon_crash` auto-blocks new task assignments
 - [ ] Trigger words included in onboarding protocol
 
 ## Phase 8 — Docs & Onboarding
+
+> Blocked by: all phases (docs reflect final state). Can draft early, finalize last.
 
 - [ ] Class profiles: `docs/classes/lead.md`, `coder.md`, `builder.md`, `oracle.md`, `recon.md`
 - [ ] Protocol doc: `docs/PROTOCOL.md`
