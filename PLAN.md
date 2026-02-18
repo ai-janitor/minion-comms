@@ -4,9 +4,10 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 
 ## Architecture
 
-- **MCP server** (Model Context Protocol) — stdio transport via FastMCP
-- Any AI tool that speaks MCP can connect: Claude Code, Codex CLI, OpenCode, Gemini, etc.
-- One shared server, multiple agents connecting simultaneously
+- **Dual transport** — same server logic, two ways in:
+  - **MCP** (stdio) via FastMCP — for AI agents (Claude Code, Codex, OpenCode, Gemini, etc.)
+  - **HTTP** (localhost) — REST API for scripts, CI/CD, monitoring, dashboards, non-MCP tools
+- One shared SQLite DB, multiple agents connecting via either transport
 - Python package: `minion-comms`
 - Runtime: `~/.minion-comms/` (DB, class profiles, protocol doc)
 
@@ -15,8 +16,10 @@ Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 - [ ] `pyproject.toml` — package config, FastMCP dependency, entry point
 - [ ] `src/minion_comms/__init__.py`
 - [ ] `src/minion_comms/server.py` — FastMCP server setup, DB init
+- [ ] `src/minion_comms/api.py` — HTTP server (Flask/FastAPI), same DB, same logic
 - [ ] `scripts/install.sh` — deploy runtime files to `~/.minion-comms/`
 - [ ] MCP config snippet for claude_desktop_config.json / .mcp.json
+- [ ] API config: default port, localhost only
 
 ## Phase 1 — Core Comms
 - [ ] All tools exposed as `@mcp.tool()` via FastMCP
