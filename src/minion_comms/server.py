@@ -1,7 +1,8 @@
-"""minion-comms MCP server — Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5.
+"""minion-comms MCP server — Phase 0-7.
 
 Multi-agent coordination: messages, registration, HP tracking, context freshness,
-battle plans, raid log, task system, file safety, and monitoring/health.
+battle plans, raid log, task system, file safety, monitoring/health, lifecycle,
+and trigger words.
 DB: ~/.minion-comms/messages.db (override with MINION_COMMS_DB_PATH)
 """
 
@@ -53,6 +54,21 @@ CLASS_STALENESS_SECONDS: dict[str, int] = {
     "recon":   5 * 60,
     "lead":    15 * 60,
     "oracle":  30 * 60,
+}
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Trigger Words (brevity codes)
+# ---------------------------------------------------------------------------
+
+TRIGGER_WORDS: dict[str, str] = {
+    "fenix_down": "Dump all knowledge to disk before context death. Revival protocol.",
+    "moon_crash": "Emergency shutdown. Everyone fenix_down NOW. No new task assignments.",
+    "sitrep":     "Request status report from target agent.",
+    "rally":      "All agents focus on the specified target/zone.",
+    "retreat":    "Pull back from current approach, reassess.",
+    "hot_zone":   "Area is dangerous/complex, proceed with caution.",
+    "stand_down": "Stop work, prepare to deregister.",
+    "recon":      "Investigate before acting. Gather intel first.",
 }
 
 # ---------------------------------------------------------------------------
@@ -143,6 +159,29 @@ def _staleness_check(cursor: sqlite3.Cursor, agent_name: str) -> tuple[bool, str
         )
 
     return False, ""
+
+
+def _scan_triggers(message: str) -> list[str]:
+    """Return list of trigger words found in message text."""
+    # Case-insensitive word boundary scan
+    lower = message.lower()
+    found: list[str] = []
+    for word in TRIGGER_WORDS:
+        if word in lower:
+            found.append(word)
+    return found
+
+
+def _format_trigger_codebook() -> str:
+    """Format the trigger word codebook for display."""
+    lines = ["## Trigger Words (Brevity Codes)", ""]
+    lines.append("Short code words for fast coordination. Use in messages — comms recognizes them automatically.")
+    lines.append("")
+    lines.append("| Code | Meaning |")
+    lines.append("|---|---|")
+    for word, meaning in TRIGGER_WORDS.items():
+        lines.append(f"| `{word}` | {meaning} |")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +299,28 @@ def init_db() -> None:
         )
     """)
 
+    # fenix_down_records — Phase 6
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fenix_down_records (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name  TEXT NOT NULL,
+            files       TEXT NOT NULL DEFAULT '[]',
+            manifest    TEXT DEFAULT '',
+            consumed    INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT NOT NULL
+        )
+    """)
+
+    # flags — Phase 7 (trigger word state, e.g. moon_crash)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flags (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            set_by      TEXT NOT NULL,
+            set_at      TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -347,6 +408,9 @@ def register(
                 "\n\nNo onboarding docs found in runtime dir. "
                 f"Check {RUNTIME_DIR}/PROTOCOL.md and {RUNTIME_DIR}/classes/{agent_class}.md"
             )
+
+        # Phase 7: append trigger word codebook to onboarding
+        result += f"\n\n---\n\n{_format_trigger_codebook()}"
 
         return result
     except Exception as e:
@@ -638,6 +702,19 @@ def send(
         sender_row = cursor.fetchone()
         sender_transport = sender_row["transport"] if sender_row else "terminal"
 
+        # --- Phase 7: trigger word detection (after message is stored) ---
+        triggers_found = _scan_triggers(message)
+
+        # moon_crash: activate emergency flag that blocks new task assignments
+        if "moon_crash" in triggers_found:
+            cursor.execute(
+                """INSERT INTO flags (key, value, set_by, set_at)
+                   VALUES ('moon_crash', '1', ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = '1', set_by = excluded.set_by, set_at = excluded.set_at""",
+                (from_agent, now),
+            )
+
         conn.commit()
 
         cc_note = f" (cc: {', '.join(cc_agents)})" if cc_agents else ""
@@ -645,7 +722,11 @@ def send(
             " REMINDER: Ensure poll.sh is running as a background process so you don't miss replies."
             if sender_transport == "terminal" else ""
         )
-        return f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}.{poll_reminder}"
+        trigger_note = (
+            " " + " ".join(f"[TRIGGER: {t}]" for t in triggers_found)
+            if triggers_found else ""
+        )
+        return f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}.{poll_reminder}{trigger_note}"
     except Exception as e:
         return f"Error sending message: {e}"
     finally:
@@ -1148,6 +1229,17 @@ def assign_task(agent_name: str, task_id: int, assigned_to: str) -> str:
     cursor = conn.cursor()
     now = datetime.datetime.now().isoformat()
     try:
+        # Phase 7: moon_crash blocks all new task assignments
+        cursor.execute(
+            "SELECT value, set_by, set_at FROM flags WHERE key = 'moon_crash'"
+        )
+        mc_row = cursor.fetchone()
+        if mc_row and mc_row["value"] == "1":
+            return (
+                "BLOCKED: moon_crash active — emergency shutdown, no new assignments. "
+                f"(set by {mc_row['set_by']} at {mc_row['set_at']})"
+            )
+
         # Lead-only enforcement
         cursor.execute(
             "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
@@ -2021,6 +2113,399 @@ def check_freshness(agent_name: str, file_paths: str) -> str:
         return json.dumps(result, indent=2)
     except Exception as e:
         return f"Error checking freshness: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — Lifecycle tools
+# ---------------------------------------------------------------------------
+
+# Class-based briefing files: which convention files each class should read on cold_start.
+CLASS_BRIEFING_FILES: dict[str, list[str]] = {
+    "lead":    [".dead-drop/CODE_MAP.md", ".dead-drop/CODE_OWNERS.md", ".dead-drop/traps/"],
+    "coder":   [".dead-drop/CODE_MAP.md", ".dead-drop/traps/"],
+    "builder": [".dead-drop/CODE_MAP.md", ".dead-drop/traps/"],
+    "oracle":  [".dead-drop/CODE_MAP.md", ".dead-drop/CODE_OWNERS.md", ".dead-drop/intel/", ".dead-drop/traps/"],
+    "recon":   [".dead-drop/CODE_MAP.md", ".dead-drop/intel/", ".dead-drop/traps/"],
+}
+
+
+@mcp.tool()
+def cold_start(agent_name: str) -> str:
+    """Bootstrap an agent into (or back into) a session. Returns everything needed to resume work.
+
+    Call this after register, or after a fenix_down + context wipe, to reload state.
+    Returns: active battle plan, recent raid log, open tasks, registered agents,
+    convention file locations for your class, and any unconsumed fenix_down records.
+
+    agent_name: the agent cold-starting. Must be registered.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Agent must be registered
+        cursor.execute(
+            "SELECT name, agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        agent_row = cursor.fetchone()
+        if not agent_row:
+            return f"BLOCKED: Agent '{agent_name}' not registered. Call register first."
+
+        agent_class = agent_row["agent_class"]
+        result: dict = {"agent_name": agent_name, "agent_class": agent_class}
+
+        # Active battle plan
+        cursor.execute(
+            "SELECT * FROM battle_plan WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+        )
+        plan_row = cursor.fetchone()
+        result["battle_plan"] = dict(plan_row) if plan_row else None
+
+        # Last 20 raid log entries (newest first)
+        cursor.execute(
+            "SELECT * FROM raid_log ORDER BY created_at DESC LIMIT 20"
+        )
+        result["raid_log"] = [dict(row) for row in cursor.fetchall()]
+
+        # All open/assigned/in_progress tasks
+        cursor.execute(
+            "SELECT * FROM tasks WHERE status IN ('open', 'assigned', 'in_progress') ORDER BY created_at DESC"
+        )
+        result["open_tasks"] = [dict(row) for row in cursor.fetchall()]
+
+        # All registered agents (compact view)
+        cursor.execute("SELECT name, agent_class, status, last_seen FROM agents ORDER BY last_seen DESC")
+        result["agents"] = [dict(row) for row in cursor.fetchall()]
+
+        # Convention file locations for this class
+        briefing_files = CLASS_BRIEFING_FILES.get(agent_class, [])
+        result["briefing_files"] = briefing_files
+
+        # Convention file locations (always included)
+        result["convention_files"] = {
+            "intel": ".dead-drop/intel/",
+            "traps": ".dead-drop/traps/",
+            "code_map": ".dead-drop/CODE_MAP.md",
+            "code_owners": ".dead-drop/CODE_OWNERS.md",
+        }
+
+        # Unconsumed fenix_down records for this agent — mark as consumed after reading
+        cursor.execute(
+            "SELECT * FROM fenix_down_records WHERE agent_name = ? AND consumed = 0 ORDER BY created_at DESC",
+            (agent_name,),
+        )
+        fenix_records = [dict(row) for row in cursor.fetchall()]
+        result["fenix_down_records"] = fenix_records
+
+        if fenix_records:
+            # Mark them consumed
+            record_ids = [r["id"] for r in fenix_records]
+            cursor.execute(
+                f"UPDATE fenix_down_records SET consumed = 1 WHERE id IN ({','.join(['?'] * len(record_ids))})",
+                record_ids,
+            )
+
+        # Update last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error in cold_start: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def fenix_down(agent_name: str, files: str, manifest: str = "") -> str:
+    """Dump session knowledge to disk before context death. Records a manifest of files written.
+
+    Call this before context wipe, compaction, or session end. After fenix_down,
+    call cold_start to reload from the manifest.
+
+    agent_name: the agent performing the fenix down. Must be registered.
+    files: comma-separated list of file paths the agent wrote this session.
+    manifest: optional summary of what was accomplished and what state was left in.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Agent must be registered
+        cursor.execute(
+            "SELECT name, agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        agent_row = cursor.fetchone()
+        if not agent_row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+
+        # Parse and clean file list
+        file_list = [f.strip() for f in files.split(",") if f.strip()]
+        if not file_list:
+            return "BLOCKED: No files provided. List the files you wrote this session."
+
+        files_json = json.dumps(file_list)
+
+        # Record the fenix_down
+        cursor.execute(
+            """INSERT INTO fenix_down_records (agent_name, files, manifest, consumed, created_at)
+               VALUES (?, ?, ?, 0, ?)""",
+            (agent_name, files_json, manifest or "", now),
+        )
+        record_id = cursor.lastrowid
+
+        # Update agent status to phoenix_down
+        cursor.execute(
+            "UPDATE agents SET status = 'phoenix_down', last_seen = ? WHERE name = ?",
+            (now, agent_name),
+        )
+
+        conn.commit()
+
+        result = (
+            f"Fenix down recorded for {agent_name} (record #{record_id}). "
+            f"{len(file_list)} file(s) in manifest. "
+            f"Status set to phoenix_down. "
+            f"Call cold_start('{agent_name}') to reload."
+        )
+        if manifest:
+            result += f" Manifest: {manifest[:120]}{'...' if len(manifest) > 120 else ''}"
+        return result
+    except Exception as e:
+        return f"Error in fenix_down: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def debrief(agent_name: str, debrief_file: str) -> str:
+    """File a session debrief. Lead only. Required before end_session.
+
+    The debrief file should summarize: what was accomplished, what's left,
+    decisions made, and recommendations for the next session.
+
+    agent_name: the lead agent filing the debrief. Must be lead class.
+    debrief_file: path to the debrief file on disk. Must exist.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can file a debrief. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # File must exist on disk
+        if not os.path.exists(debrief_file):
+            return f"BLOCKED: Debrief file does not exist: {debrief_file}"
+
+        # Record as critical raid log entry
+        cursor.execute(
+            """INSERT INTO raid_log (agent_name, entry, priority, created_at)
+               VALUES (?, ?, 'critical', ?)""",
+            (agent_name, f"DEBRIEF FILED: {debrief_file}", now),
+        )
+
+        # Update last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+        return f"Debrief filed by {agent_name}: {debrief_file}"
+    except Exception as e:
+        return f"Error filing debrief: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def end_session(agent_name: str) -> str:
+    """End the current session. Lead only.
+
+    BLOCKS if:
+    - No debrief has been filed this session (check raid_log for DEBRIEF FILED entry)
+    - There are open/assigned/in_progress tasks remaining
+
+    Marks the active battle plan as completed and returns a session summary.
+
+    agent_name: the lead agent ending the session. Must be lead class.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can end the session. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Check for debrief — look for a critical raid log entry with "DEBRIEF FILED"
+        cursor.execute(
+            "SELECT COUNT(*) FROM raid_log WHERE priority = 'critical' AND entry LIKE 'DEBRIEF FILED:%'"
+        )
+        if cursor.fetchone()[0] == 0:
+            return (
+                "BLOCKED: No debrief filed this session. "
+                "Lead must call debrief(agent_name, debrief_file) before ending the session."
+            )
+
+        # Check for open tasks
+        cursor.execute(
+            "SELECT id, title, status, assigned_to FROM tasks WHERE status IN ('open', 'assigned', 'in_progress')"
+        )
+        open_tasks = [dict(row) for row in cursor.fetchall()]
+        if open_tasks:
+            task_list = "; ".join(
+                f"#{t['id']} {t['title']} ({t['status']}, assigned={t.get('assigned_to', 'none')})"
+                for t in open_tasks
+            )
+            return (
+                f"BLOCKED: {len(open_tasks)} open task(s) remaining. "
+                f"Close, abandon, or mark them obsolete before ending the session. "
+                f"Tasks: {task_list}"
+            )
+
+        # Mark active battle plan as completed
+        cursor.execute(
+            "SELECT id, plan FROM battle_plan WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+        )
+        plan_row = cursor.fetchone()
+        plan_summary = "No active battle plan found."
+        if plan_row:
+            cursor.execute(
+                "UPDATE battle_plan SET status = 'completed', updated_at = ? WHERE id = ?",
+                (now, plan_row["id"]),
+            )
+            plan_summary = f"Battle plan #{plan_row['id']} marked completed."
+
+        # Build session summary
+        # Total tasks closed this session
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'closed'"
+        )
+        closed_count = cursor.fetchone()[0]
+
+        # Total raid log entries
+        cursor.execute("SELECT COUNT(*) FROM raid_log")
+        log_count = cursor.fetchone()[0]
+
+        # Agents registered
+        cursor.execute("SELECT name, agent_class, status FROM agents ORDER BY name")
+        agents = [dict(row) for row in cursor.fetchall()]
+
+        # Fenix down records this session
+        cursor.execute("SELECT COUNT(*) FROM fenix_down_records")
+        fenix_count = cursor.fetchone()[0]
+
+        # Log the session end
+        cursor.execute(
+            """INSERT INTO raid_log (agent_name, entry, priority, created_at)
+               VALUES (?, ?, 'critical', ?)""",
+            (agent_name, "SESSION ENDED", now),
+        )
+
+        conn.commit()
+
+        summary = {
+            "status": "Session ended.",
+            "battle_plan": plan_summary,
+            "tasks_closed": closed_count,
+            "raid_log_entries": log_count,
+            "fenix_down_records": fenix_count,
+            "agents": agents,
+            "ended_by": agent_name,
+            "ended_at": now,
+        }
+        return json.dumps(summary, indent=2)
+    except Exception as e:
+        return f"Error ending session: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Trigger Word tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_triggers() -> str:
+    """Return the trigger word codebook — all brevity codes and their meanings.
+
+    Use this to look up what a trigger word means, or to see the full list.
+    Agents learn these on registration, but can call this anytime for a refresher.
+    """
+    result = json.dumps(TRIGGER_WORDS, indent=2)
+    result += "\n\nUsage: Include a trigger word in any send() message. "
+    result += "Comms recognizes it automatically and tags the response."
+    result += "\nSpecial: moon_crash auto-blocks all new task assignments."
+    return result
+
+
+@mcp.tool()
+def clear_moon_crash(agent_name: str) -> str:
+    """Clear the moon_crash emergency flag, re-enabling task assignments. Lead only.
+
+    Call this after the emergency is resolved and the team is ready to resume.
+
+    agent_name: the lead agent clearing the flag.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can clear moon_crash. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Check if moon_crash is active
+        cursor.execute(
+            "SELECT value FROM flags WHERE key = 'moon_crash'"
+        )
+        flag_row = cursor.fetchone()
+        if not flag_row or flag_row["value"] != "1":
+            return "moon_crash is not currently active."
+
+        cursor.execute(
+            """UPDATE flags SET value = '0', set_by = ?, set_at = ?
+               WHERE key = 'moon_crash'""",
+            (agent_name, now),
+        )
+        conn.commit()
+        return f"moon_crash cleared by {agent_name}. Task assignments re-enabled."
+    except Exception as e:
+        return f"Error clearing moon_crash: {e}"
     finally:
         conn.close()
 
