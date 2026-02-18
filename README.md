@@ -8,12 +8,22 @@ AI agents have finite context windows. When multiple agents work on the same cod
 
 Minion Comms treats multi-agent engineering like an RPG raid. The codebase is the boss. Agents are the raid party. Context is reverse HP — you start full and every action drains you.
 
+## If you ever raided in WoW or wiped in FF, you already get this
+
+Context windows are HP bars. Compaction is getting dazed mid-fight. A coder exploring the wrong files is a DPS pulling aggro on trash mobs. An oracle who hasn't read the latest intel is a healer with stale buffs. And when the lead goes down, it's a raid wipe — nobody else has the full picture.
+
+This isn't a metaphor bolted on after the fact. The problems are the same problems:
+- **Party composition matters.** One buffed coder with oracle support > three coders exploring alone. Same as one geared DPS with a dedicated healer > three undergeared DPS facepulling.
+- **You can't outheal stupid.** High activity count on a task means wrong approach — ice spell on an ice boss. Pull back, reassess, change angle.
+- **Loot that isn't picked up is wasted.** An agent's findings that aren't written down die when their context window fills. XP that isn't shared is XP lost.
+- **The raid leader's job is fighting entropy.** Knowledge wants to die with agents. Lead's job is making sure it doesn't.
+
 ## Inspired by
 
-- **Dead Drop Teams** — v1 of this system. SQLite message passing with role-based agents and auto-CC to lead. Minion Comms is the next evolution.
-- **RPG raids** — party composition, class roles, HP management, buff coverage, loot systems
-- **Majora's Mask** — `moon_crash` trigger word for emergency session shutdown
-- **Final Fantasy** — `fenix_down` for knowledge dump before context death
+- **World of Warcraft** — raid composition, tank/DPS/healer roles, buff coverage, aggro management, zone assignments, raid leader coordination
+- **Final Fantasy** — `fenix_down` (Phoenix Down) for revival after context death, party class system
+- **Majora's Mask** — `moon_crash` for emergency shutdown (the moon is falling, everyone dump and run)
+- **Dead Drop Teams** — v1 of this system. SQLite message passing with role-based agents. Minion Comms is the evolution.
 - **Vercel/Next.js** — filesystem-as-database pattern for convention files
 - **Military comms** — brevity codes, CC discipline, chain of command
 
