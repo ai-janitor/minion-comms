@@ -6,7 +6,7 @@ set -euo pipefail
 
 REPO="https://github.com/ai-janitor/minion-comms.git"
 RUNTIME_DIR="$HOME/.minion-comms"
-MCP_CONFIG="$HOME/.claude/mcp.json"
+MCP_CONFIG="$HOME/.claude.json"
 DOCS_BASE_URL="https://raw.githubusercontent.com/ai-janitor/minion-comms/main/docs"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -70,44 +70,51 @@ ok "Onboarding docs deployed to ${RUNTIME_DIR}/"
 
 info "Configuring MCP..."
 
-mkdir -p "$(dirname "${MCP_CONFIG}")"
-
-add_mcp_entry() {
-    local config="$1"
-    # Check if minion-comms already configured
-    if [ -f "$config" ] && grep -q '"minion-comms"' "$config" 2>/dev/null; then
-        info "minion-comms already in ${config} — skipping"
-        return
+# Prefer `claude mcp add` (knows the correct config location and format).
+# Fall back to manual JSON edit of ~/.claude.json if claude CLI not available.
+if command -v claude &>/dev/null; then
+    if [ -f "${MCP_CONFIG}" ] && grep -q '"minion-comms"' "${MCP_CONFIG}" 2>/dev/null; then
+        info "minion-comms already configured — skipping"
+    else
+        claude mcp add --scope user minion-comms -- minion-comms 2>/dev/null \
+            && ok "Added minion-comms via claude mcp add" \
+            || warn "claude mcp add failed — adding manually"
     fi
+else
+    info "claude CLI not found — configuring ${MCP_CONFIG} directly"
 
-    if command -v jq &>/dev/null; then
-        # Use jq for safe JSON manipulation
-        if [ -f "$config" ] && [ -s "$config" ]; then
-            jq '.mcpServers["minion-comms"] = {"command": "minion-comms"}' "$config" > "${config}.tmp" \
-                && mv "${config}.tmp" "$config"
-        else
-            echo '{"mcpServers":{"minion-comms":{"command":"minion-comms"}}}' | jq . > "$config"
+    add_mcp_entry() {
+        local config="$1"
+        if [ -f "$config" ] && grep -q '"minion-comms"' "$config" 2>/dev/null; then
+            info "minion-comms already in ${config} — skipping"
+            return
         fi
-    elif command -v python3 &>/dev/null; then
-        # Fallback: Python one-liner
-        python3 -c "
+
+        if command -v jq &>/dev/null; then
+            if [ -f "$config" ] && [ -s "$config" ]; then
+                jq '.mcpServers["minion-comms"] = {"type": "stdio", "command": "minion-comms", "args": [], "env": {}}' "$config" > "${config}.tmp" \
+                    && mv "${config}.tmp" "$config"
+            else
+                echo '{"mcpServers":{"minion-comms":{"type":"stdio","command":"minion-comms","args":[],"env":{}}}}' | jq . > "$config"
+            fi
+        elif command -v python3 &>/dev/null; then
+            python3 -c "
 import json, os
 p = '$config'
 d = json.load(open(p)) if os.path.isfile(p) and os.path.getsize(p) > 0 else {}
-d.setdefault('mcpServers', {})['minion-comms'] = {'command': 'minion-comms'}
+d.setdefault('mcpServers', {})['minion-comms'] = {'type': 'stdio', 'command': 'minion-comms', 'args': [], 'env': {}}
 json.dump(d, open(p, 'w'), indent=2)
-print()
 "
-    else
-        warn "Neither jq nor python3 found — add this to ${config} manually:"
-        warn '  {"mcpServers": {"minion-comms": {"command": "minion-comms"}}}'
-        return
-    fi
+        else
+            warn "Add manually: claude mcp add --scope user minion-comms -- minion-comms"
+            return
+        fi
 
-    ok "Added minion-comms to ${config}"
-}
+        ok "Added minion-comms to ${config}"
+    }
 
-add_mcp_entry "${MCP_CONFIG}"
+    add_mcp_entry "${MCP_CONFIG}"
+fi
 
 # ── Done ────────────────────────────────────────────────────────────────────
 
