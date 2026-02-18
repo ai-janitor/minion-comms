@@ -1677,6 +1677,355 @@ def get_claims(agent_name: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 — Monitoring & Health tools
+# ---------------------------------------------------------------------------
+
+def _has_table(cursor: sqlite3.Cursor, table_name: str) -> bool:
+    """Check if a table exists in the database."""
+    cursor.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    )
+    return cursor.fetchone()[0] > 0
+
+
+def _safe_mtime(file_path: str) -> str | None:
+    """Return ISO mtime for a file, or None if the file doesn't exist."""
+    try:
+        mtime = os.path.getmtime(file_path)
+        return datetime.datetime.fromtimestamp(mtime).isoformat()
+    except OSError:
+        return None
+
+
+def _agent_judgment(last_seen: str | None, last_task_update: str | None,
+                    file_mtimes: list[str | None]) -> str:
+    """Return a summary judgment: active / idle / possibly dead.
+
+    Checks (in order): recent file edits, last_seen, last task update.
+    """
+    now = datetime.datetime.now()
+
+    # Check if any file was modified in the last 5 minutes
+    for mt in file_mtimes:
+        if mt:
+            try:
+                mtime_dt = datetime.datetime.fromisoformat(mt)
+                if (now - mtime_dt).total_seconds() < 5 * 60:
+                    return "active"
+            except ValueError:
+                pass
+
+    # Check last_seen
+    if last_seen:
+        try:
+            ls = datetime.datetime.fromisoformat(last_seen)
+            age_min = (now - ls).total_seconds() / 60
+            if age_min < 5:
+                return "active"
+            if age_min < 15:
+                return "idle"
+            return "possibly dead"
+        except ValueError:
+            pass
+
+    # Check last task update as fallback
+    if last_task_update:
+        try:
+            ltu = datetime.datetime.fromisoformat(last_task_update)
+            age_min = (now - ltu).total_seconds() / 60
+            if age_min < 5:
+                return "active"
+            if age_min < 15:
+                return "idle"
+            return "possibly dead"
+        except ValueError:
+            pass
+
+    return "possibly dead"
+
+
+@mcp.tool()
+def party_status() -> str:
+    """Full raid health dashboard in one call. Lead's primary monitoring tool.
+
+    Returns JSON with every agent's HP, class, status, transport, context_stale flag,
+    last_seen_mins_ago, open tasks count, activity counts, and claimed files (if available).
+    Poll this every 2-5 minutes to monitor the raid.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now()
+    try:
+        cursor.execute("SELECT * FROM agents ORDER BY last_seen DESC")
+        agents = []
+        has_claims = _has_table(cursor, "file_claims")
+
+        for row in cursor.fetchall():
+            a = dict(row)
+            name = a["name"]
+
+            # HP summary
+            a["hp"] = _hp_summary(a.get("context_tokens_used"), a.get("context_tokens_limit"))
+
+            # Staleness flag
+            threshold = CLASS_STALENESS_SECONDS.get(a.get("agent_class", ""), None)
+            stale = False
+            if threshold and a.get("context_updated_at"):
+                try:
+                    updated = datetime.datetime.fromisoformat(a["context_updated_at"])
+                    stale = (now - updated).total_seconds() > threshold
+                except ValueError:
+                    pass
+            elif threshold and not a.get("context_updated_at"):
+                stale = True
+            a["context_stale"] = stale
+
+            # Last-seen age
+            last_seen_mins = None
+            if a.get("last_seen"):
+                try:
+                    ls = datetime.datetime.fromisoformat(a["last_seen"])
+                    last_seen_mins = int((now - ls).total_seconds() // 60)
+                except ValueError:
+                    pass
+            a["last_seen_mins_ago"] = last_seen_mins
+
+            # Open tasks count and total activity across active tasks
+            cursor.execute(
+                """SELECT COUNT(*) as cnt, COALESCE(SUM(activity_count), 0) as total_activity
+                   FROM tasks
+                   WHERE assigned_to = ?
+                   AND status IN ('open', 'assigned', 'in_progress')""",
+                (name,),
+            )
+            task_row = cursor.fetchone()
+            a["open_tasks"] = task_row["cnt"]
+            a["total_activity"] = task_row["total_activity"]
+
+            # Claimed files with mtime (Phase 4 may not exist yet)
+            claimed_files = []
+            if has_claims:
+                try:
+                    cursor.execute(
+                        "SELECT file_path, claimed_at FROM file_claims WHERE agent_name = ?",
+                        (name,),
+                    )
+                    for claim in cursor.fetchall():
+                        fp = claim["file_path"]
+                        claimed_files.append({
+                            "file_path": fp,
+                            "claimed_at": claim["claimed_at"],
+                            "mtime": _safe_mtime(fp),
+                        })
+                except Exception:
+                    pass
+            a["claimed_files"] = claimed_files
+
+            # Strip verbose fields to keep the dashboard compact
+            for key in ("context", "context_tokens_used", "context_tokens_limit"):
+                a.pop(key, None)
+
+            agents.append(a)
+
+        if not agents:
+            return "No agents registered."
+        return json.dumps(agents, indent=2)
+    except Exception as e:
+        return f"Error getting party status: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def check_activity(agent_name: str) -> str:
+    """Check a specific agent's activity level. Returns claimed files with mtime,
+    zone info, last seen, last task update, and a judgment (active/idle/possibly dead).
+
+    Use this when an agent seems quiet — before nudging or reassigning.
+
+    agent_name: the agent to check.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now()
+    try:
+        cursor.execute("SELECT * FROM agents WHERE name = ?", (agent_name,))
+        row = cursor.fetchone()
+        if not row:
+            return f"Agent '{agent_name}' not found."
+
+        result: dict = {
+            "agent_name": agent_name,
+            "agent_class": row["agent_class"],
+            "status": row["status"],
+            "last_seen": row["last_seen"],
+        }
+
+        # Last-seen age
+        if row["last_seen"]:
+            try:
+                ls = datetime.datetime.fromisoformat(row["last_seen"])
+                result["last_seen_mins_ago"] = int((now - ls).total_seconds() // 60)
+            except ValueError:
+                pass
+
+        # Active tasks — most recent updated_at first
+        cursor.execute(
+            """SELECT id, title, status, updated_at, activity_count, zone
+               FROM tasks
+               WHERE assigned_to = ?
+               AND status IN ('open', 'assigned', 'in_progress')
+               ORDER BY updated_at DESC""",
+            (agent_name,),
+        )
+        active_tasks = [dict(t) for t in cursor.fetchall()]
+        result["active_tasks"] = active_tasks
+        result["last_task_update"] = active_tasks[0]["updated_at"] if active_tasks else None
+
+        # Claimed files with mtime (Phase 4 may not exist yet)
+        claimed_files = []
+        claimed_mtimes: list[str | None] = []
+        has_claims = _has_table(cursor, "file_claims")
+        if has_claims:
+            try:
+                cursor.execute(
+                    "SELECT file_path, claimed_at FROM file_claims WHERE agent_name = ?",
+                    (agent_name,),
+                )
+                for claim in cursor.fetchall():
+                    fp = claim["file_path"]
+                    mt = _safe_mtime(fp)
+                    claimed_files.append({
+                        "file_path": fp,
+                        "claimed_at": claim["claimed_at"],
+                        "mtime": mt,
+                    })
+                    claimed_mtimes.append(mt)
+            except Exception:
+                pass
+        result["claimed_files"] = claimed_files
+
+        # Zone info — gather zones from active tasks
+        zones: set[str] = set()
+        for t in active_tasks:
+            if t.get("zone"):
+                zones.add(t["zone"])
+        result["zones"] = sorted(zones)
+
+        # Zone directory mtime — if zones are directories, check for recent changes
+        zone_mtimes: list[str | None] = []
+        for z in zones:
+            if os.path.isdir(z):
+                zone_mtimes.append(_safe_mtime(z))
+        if zone_mtimes:
+            result["zone_mtimes"] = zone_mtimes
+
+        # Judgment — combine all file signals
+        all_mtimes = claimed_mtimes + zone_mtimes
+        result["judgment"] = _agent_judgment(
+            row["last_seen"], result["last_task_update"], all_mtimes
+        )
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error checking activity: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def check_freshness(agent_name: str, file_paths: str) -> str:
+    """Check which files have been modified since an agent's last set_context.
+
+    Use this to detect if an agent is working with stale data — files changed
+    under them since they last loaded context.
+
+    agent_name: the agent to check freshness for.
+    file_paths: comma-separated list of file paths to check.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT context_updated_at FROM agents WHERE name = ?",
+            (agent_name,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"Agent '{agent_name}' not found."
+
+        context_updated_at = row["context_updated_at"]
+        paths = [p.strip() for p in file_paths.split(",") if p.strip()]
+
+        if not paths:
+            return "No file paths provided."
+
+        if not context_updated_at:
+            # Never set context — everything is stale by definition
+            stale_files = []
+            for fp in paths:
+                mt = _safe_mtime(fp)
+                stale_files.append({
+                    "file_path": fp,
+                    "mtime": mt,
+                    "exists": os.path.exists(fp),
+                    "stale": True,
+                })
+            return json.dumps({
+                "agent_name": agent_name,
+                "context_updated_at": None,
+                "note": "Agent has never called set_context — all files considered stale.",
+                "files": stale_files,
+                "stale_count": len([f for f in stale_files if f["exists"]]),
+            }, indent=2)
+
+        try:
+            context_dt = datetime.datetime.fromisoformat(context_updated_at)
+            context_ts = context_dt.timestamp()
+        except ValueError:
+            return f"Error: invalid context_updated_at timestamp for '{agent_name}'."
+
+        files_result = []
+        stale_count = 0
+
+        for fp in paths:
+            entry: dict = {"file_path": fp, "exists": os.path.exists(fp)}
+            if os.path.exists(fp):
+                try:
+                    file_mtime = os.path.getmtime(fp)
+                    entry["mtime"] = datetime.datetime.fromtimestamp(file_mtime).isoformat()
+                    entry["stale"] = file_mtime > context_ts
+                    if entry["stale"]:
+                        stale_count += 1
+                except OSError:
+                    entry["mtime"] = None
+                    entry["stale"] = False
+            else:
+                entry["mtime"] = None
+                entry["stale"] = False
+            files_result.append(entry)
+
+        result = {
+            "agent_name": agent_name,
+            "context_updated_at": context_updated_at,
+            "files": files_result,
+            "stale_count": stale_count,
+        }
+        if stale_count > 0:
+            result["warning"] = (
+                f"{stale_count} file(s) modified since last set_context. "
+                f"Agent may be working with outdated data."
+            )
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error checking freshness: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
