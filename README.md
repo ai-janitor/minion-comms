@@ -1,6 +1,6 @@
 # Minion Comms
 
-Multi-agent coordination server inspired by RPG raid mechanics. MCP-based comms network for AI coding agents.
+Multi-agent coordination server inspired by RPG raid mechanics. Built on [MCP](https://modelcontextprotocol.io) (Model Context Protocol) — any AI tool that speaks MCP can join the raid: Claude Code, Codex CLI, OpenCode, Gemini, or anything else.
 
 ## What is this?
 

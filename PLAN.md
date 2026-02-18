@@ -2,9 +2,24 @@
 
 Built from `docs/FRAMEWORK.md`. Dead-drop-teams v1 is reference implementation.
 
-## Phase 1 — Core Comms (port from dead-drop v1)
+## Architecture
 
-- [ ] Project structure: `src/minion_comms/server.py`, `pyproject.toml`
+- **MCP server** (Model Context Protocol) — stdio transport via FastMCP
+- Any AI tool that speaks MCP can connect: Claude Code, Codex CLI, OpenCode, Gemini, etc.
+- One shared server, multiple agents connecting simultaneously
+- Python package: `minion-comms`
+- Runtime: `~/.minion-comms/` (DB, class profiles, protocol doc)
+
+## Phase 0 — Scaffolding
+
+- [ ] `pyproject.toml` — package config, FastMCP dependency, entry point
+- [ ] `src/minion_comms/__init__.py`
+- [ ] `src/minion_comms/server.py` — FastMCP server setup, DB init
+- [ ] `scripts/install.sh` — deploy runtime files to `~/.minion-comms/`
+- [ ] MCP config snippet for claude_desktop_config.json / .mcp.json
+
+## Phase 1 — Core Comms
+- [ ] All tools exposed as `@mcp.tool()` via FastMCP
 - [ ] SQLite schema: agents (with `agent_class`, `model` fields), messages, broadcast_reads
 - [ ] `register` — with class validation, model whitelist enforcement, onboarding
 - [ ] `send` — inbox discipline (block on unread), context freshness (block on stale, class-based thresholds), auto-CC lead, poll.sh reminder
