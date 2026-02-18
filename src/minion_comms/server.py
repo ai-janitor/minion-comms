@@ -1,6 +1,7 @@
-"""minion-comms MCP server — Phase 0 + Phase 1.
+"""minion-comms MCP server — Phase 0 + Phase 1 + Phase 2.
 
-Multi-agent coordination: messages, registration, HP tracking, context freshness.
+Multi-agent coordination: messages, registration, HP tracking, context freshness,
+battle plans, and raid log.
 DB: ~/.minion-comms/messages.db (override with MINION_COMMS_DB_PATH)
 """
 
@@ -27,6 +28,13 @@ mcp = FastMCP("Minion Comms")
 # ---------------------------------------------------------------------------
 
 VALID_CLASSES = {"lead", "coder", "builder", "oracle", "recon"}
+
+BATTLE_PLAN_STATUSES = {"active", "superseded", "completed", "abandoned", "obsolete"}
+RAID_LOG_PRIORITIES = {"low", "normal", "high", "critical"}
+TASK_STATUSES = {
+    "open", "assigned", "in_progress", "fixed", "verified",
+    "closed", "abandoned", "stale", "obsolete",
+}
 
 # Models allowed per class. Empty set = any model allowed.
 CLASS_MODEL_WHITELIST: dict[str, set[str]] = {
@@ -160,7 +168,8 @@ def init_db() -> None:
             status              TEXT DEFAULT 'waiting for work',
             context             TEXT DEFAULT NULL,
             context_tokens_used   INTEGER DEFAULT NULL,
-            context_tokens_limit  INTEGER DEFAULT NULL
+            context_tokens_limit  INTEGER DEFAULT NULL,
+            transport             TEXT DEFAULT 'terminal'
         )
     """)
 
@@ -187,6 +196,50 @@ def init_db() -> None:
         )
     """)
 
+    # battle_plan — Phase 2
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS battle_plan (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            set_by      TEXT NOT NULL,
+            plan        TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'active',
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        )
+    """)
+
+    # raid_log — Phase 2
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raid_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name  TEXT NOT NULL,
+            entry       TEXT NOT NULL,
+            priority    TEXT NOT NULL DEFAULT 'normal',
+            created_at  TEXT NOT NULL
+        )
+    """)
+
+    # tasks — Phase 3
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            title           TEXT NOT NULL,
+            task_file       TEXT NOT NULL,
+            project         TEXT DEFAULT NULL,
+            zone            TEXT DEFAULT NULL,
+            status          TEXT NOT NULL DEFAULT 'open',
+            blocked_by      TEXT DEFAULT NULL,
+            assigned_to     TEXT DEFAULT NULL,
+            created_by      TEXT NOT NULL,
+            files           TEXT DEFAULT NULL,
+            progress        TEXT DEFAULT NULL,
+            activity_count  INTEGER NOT NULL DEFAULT 0,
+            result_file     TEXT DEFAULT NULL,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -201,6 +254,7 @@ def register(
     agent_class: str,
     model: str = "",
     description: str = "",
+    transport: str = "terminal",
 ) -> str:
     """Register this agent into minion-comms.
 
@@ -209,7 +263,10 @@ def register(
     model: the model ID this agent is running on (e.g. 'claude-sonnet-4-6').
            Used for model restriction enforcement — honest self-reporting expected.
     description: what this agent does / what zone they own.
+    transport: 'terminal' (human CLI, needs poll.sh) or 'daemon' (swarm-managed, no polling).
     """
+    if transport not in ("terminal", "daemon"):
+        return f"BLOCKED: Invalid transport '{transport}'. Must be 'terminal' or 'daemon'."
     if agent_class not in VALID_CLASSES:
         return (
             f"BLOCKED: Unknown class '{agent_class}'. "
@@ -231,16 +288,17 @@ def register(
         cursor.execute(
             """
             INSERT INTO agents
-                (name, agent_class, model, registered_at, last_seen, description, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'waiting for work')
+                (name, agent_class, model, registered_at, last_seen, description, status, transport)
+            VALUES (?, ?, ?, ?, ?, ?, 'waiting for work', ?)
             ON CONFLICT(name) DO UPDATE SET
                 last_seen   = excluded.last_seen,
                 agent_class = excluded.agent_class,
                 model       = COALESCE(NULLIF(excluded.model, ''), agents.model),
                 description = COALESCE(NULLIF(excluded.description, ''), agents.description),
+                transport   = excluded.transport,
                 status      = 'waiting for work'
             """,
-            (agent_name, agent_class, model or None, now, now, description or None),
+            (agent_name, agent_class, model or None, now, now, description or None, transport),
         )
 
         # Auto-mark broadcasts older than 1 hour as read (don't blast new agents with history)
@@ -478,6 +536,16 @@ def send(
                 f"Call check_inbox first."
             )
 
+        # --- battle plan enforcement: lead must set a plan before comms flow ---
+        cursor.execute(
+            "SELECT COUNT(*) FROM battle_plan WHERE status = 'active'"
+        )
+        if cursor.fetchone()[0] == 0:
+            return (
+                "BLOCKED: No active battle plan. "
+                "Lead must call set_battle_plan before comms can flow."
+            )
+
         # --- context freshness: class-based staleness enforcement ---
         is_stale, stale_msg = _staleness_check(cursor, from_agent)
         if is_stale:
@@ -514,13 +582,19 @@ def send(
         # Update sender's last_seen
         cursor.execute("UPDATE agents SET last_seen = ? WHERE name = ?", (now, from_agent))
 
+        # Check sender's transport for poll.sh reminder
+        cursor.execute("SELECT transport FROM agents WHERE name = ?", (from_agent,))
+        sender_row = cursor.fetchone()
+        sender_transport = sender_row["transport"] if sender_row else "terminal"
+
         conn.commit()
 
         cc_note = f" (cc: {', '.join(cc_agents)})" if cc_agents else ""
-        return (
-            f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}. "
-            f"REMINDER: Ensure poll.sh is running as a background process so you don't miss replies."
+        poll_reminder = (
+            " REMINDER: Ensure poll.sh is running as a background process so you don't miss replies."
+            if sender_transport == "terminal" else ""
         )
+        return f"Message sent from '{from_agent}' to '{to_agent}'{cc_note}.{poll_reminder}"
     except Exception as e:
         return f"Error sending message: {e}"
     finally:
@@ -669,6 +743,691 @@ def purge_inbox(agent_name: str, older_than_hours: int = 2) -> str:
         )
     except Exception as e:
         return f"Error purging inbox: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — War Room tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def set_battle_plan(agent_name: str, plan: str) -> str:
+    """Set the active battle plan for the session. Lead only.
+
+    Describes session goals, priorities, zone assignments, order of attack.
+    Setting a new plan automatically supersedes the previous active plan.
+    Must be set before any agent can send messages.
+
+    agent_name: the lead agent setting the plan.
+    plan: the battle plan text.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can set the battle plan. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Supersede any currently active plan
+        cursor.execute(
+            "UPDATE battle_plan SET status = 'superseded', updated_at = ? WHERE status = 'active'",
+            (now,),
+        )
+
+        # Insert new active plan
+        cursor.execute(
+            """INSERT INTO battle_plan (set_by, plan, status, created_at, updated_at)
+               VALUES (?, ?, 'active', ?, ?)""",
+            (agent_name, plan, now, now),
+        )
+
+        plan_id = cursor.lastrowid
+        conn.commit()
+        return f"Battle plan #{plan_id} set by {agent_name}. Status: active."
+    except Exception as e:
+        return f"Error setting battle plan: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_battle_plan(status: str = "active") -> str:
+    """Get the current battle plan (or query by status).
+
+    status: one of active, superseded, completed, abandoned, obsolete.
+             Defaults to 'active'.
+    """
+    if status not in BATTLE_PLAN_STATUSES:
+        return (
+            f"Invalid status '{status}'. "
+            f"Valid: {', '.join(sorted(BATTLE_PLAN_STATUSES))}"
+        )
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT * FROM battle_plan WHERE status = ? ORDER BY created_at DESC",
+            (status,),
+        )
+        plans = [dict(row) for row in cursor.fetchall()]
+        if not plans:
+            return f"No battle plans with status '{status}'."
+        return json.dumps(plans, indent=2)
+    except Exception as e:
+        return f"Error getting battle plan: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def update_battle_plan_status(agent_name: str, plan_id: int, status: str) -> str:
+    """Update the status of a battle plan. Lead only.
+
+    Use to mark plans as completed, abandoned, or obsolete at session end.
+
+    agent_name: the lead agent updating the plan.
+    plan_id: the battle plan ID.
+    status: one of active, superseded, completed, abandoned, obsolete.
+    """
+    if status not in BATTLE_PLAN_STATUSES:
+        return (
+            f"Invalid status '{status}'. "
+            f"Valid: {', '.join(sorted(BATTLE_PLAN_STATUSES))}"
+        )
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can update battle plan status. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Check plan exists
+        cursor.execute(
+            "SELECT id, status FROM battle_plan WHERE id = ?", (plan_id,)
+        )
+        plan_row = cursor.fetchone()
+        if not plan_row:
+            return f"Battle plan #{plan_id} not found."
+
+        old_status = plan_row["status"]
+        cursor.execute(
+            "UPDATE battle_plan SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, plan_id),
+        )
+        conn.commit()
+        return f"Battle plan #{plan_id} status: {old_status} -> {status}."
+    except Exception as e:
+        return f"Error updating battle plan status: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def log_raid(agent_name: str, entry: str, priority: str = "normal") -> str:
+    """Append an entry to the raid log. Any agent can write.
+
+    The raid log is the team's persistent memory — survives compaction.
+    Use for decisions, findings, blockers, status updates.
+
+    agent_name: who is logging.
+    entry: the log entry text.
+    priority: low | normal | high | critical.
+    """
+    if priority not in RAID_LOG_PRIORITIES:
+        return (
+            f"Invalid priority '{priority}'. "
+            f"Valid: {', '.join(sorted(RAID_LOG_PRIORITIES))}"
+        )
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify agent exists
+        cursor.execute("SELECT name FROM agents WHERE name = ?", (agent_name,))
+        if not cursor.fetchone():
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+
+        cursor.execute(
+            """INSERT INTO raid_log (agent_name, entry, priority, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (agent_name, entry, priority, now),
+        )
+        log_id = cursor.lastrowid
+
+        # Update last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+        return f"Raid log #{log_id} by {agent_name} [{priority}]: {entry[:80]}{'...' if len(entry) > 80 else ''}"
+    except Exception as e:
+        return f"Error logging to raid log: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_raid_log(
+    priority: str = "",
+    count: int = 20,
+    agent_name: str = "",
+) -> str:
+    """Read the raid log. Supports filtering by priority and agent.
+
+    priority: filter to a specific level (low/normal/high/critical).
+              Empty string = all priorities.
+    count: max entries to return (default 20, newest first).
+    agent_name: filter to entries from a specific agent. Empty = all agents.
+    """
+    if priority and priority not in RAID_LOG_PRIORITIES:
+        return (
+            f"Invalid priority '{priority}'. "
+            f"Valid: {', '.join(sorted(RAID_LOG_PRIORITIES))}"
+        )
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        query = "SELECT * FROM raid_log WHERE 1=1"
+        params: list[str | int] = []
+
+        if priority:
+            query += " AND priority = ?"
+            params.append(priority)
+
+        if agent_name:
+            query += " AND agent_name = ?"
+            params.append(agent_name)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(count)
+
+        cursor.execute(query, params)
+        entries = [dict(row) for row in cursor.fetchall()]
+
+        if not entries:
+            filter_desc = []
+            if priority:
+                filter_desc.append(f"priority={priority}")
+            if agent_name:
+                filter_desc.append(f"agent={agent_name}")
+            desc = f" ({', '.join(filter_desc)})" if filter_desc else ""
+            return f"No raid log entries{desc}."
+
+        # Return newest-first (already sorted by query)
+        return json.dumps(entries, indent=2)
+    except Exception as e:
+        return f"Error reading raid log: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Task System tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_task(
+    agent_name: str,
+    title: str,
+    task_file: str,
+    project: str = "",
+    zone: str = "",
+    blocked_by: str = "",
+) -> str:
+    """Create a new task. Lead only. Requires an active battle plan.
+
+    agent_name: the lead agent creating this task.
+    title: short description of the task.
+    task_file: path to the task spec file on disk (must exist).
+    project: which project this task belongs to (optional).
+    zone: which zone this task targets (optional).
+    blocked_by: comma-separated task IDs that block this task (optional).
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can create tasks. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Active battle plan required
+        cursor.execute(
+            "SELECT COUNT(*) FROM battle_plan WHERE status = 'active'"
+        )
+        if cursor.fetchone()[0] == 0:
+            return (
+                "BLOCKED: No active battle plan. "
+                "Lead must call set_battle_plan before creating tasks."
+            )
+
+        # task_file must exist on disk
+        if not os.path.exists(task_file):
+            return f"BLOCKED: Task file does not exist: {task_file}"
+
+        # Validate blocked_by task IDs
+        blocker_ids: list[int] = []
+        if blocked_by:
+            for raw_id in blocked_by.split(","):
+                raw_id = raw_id.strip()
+                if not raw_id:
+                    continue
+                try:
+                    tid = int(raw_id)
+                except ValueError:
+                    return f"BLOCKED: Invalid task ID in blocked_by: '{raw_id}'. Must be integers."
+                cursor.execute("SELECT id FROM tasks WHERE id = ?", (tid,))
+                if not cursor.fetchone():
+                    return f"BLOCKED: blocked_by task #{tid} does not exist."
+                blocker_ids.append(tid)
+
+        blocked_by_str = ",".join(str(i) for i in blocker_ids) if blocker_ids else None
+
+        cursor.execute(
+            """INSERT INTO tasks
+               (title, task_file, project, zone, status, blocked_by,
+                created_by, activity_count, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'open', ?, ?, 0, ?, ?)""",
+            (
+                title,
+                task_file,
+                project or None,
+                zone or None,
+                blocked_by_str,
+                agent_name,
+                now,
+                now,
+            ),
+        )
+        task_id = cursor.lastrowid
+        conn.commit()
+
+        blocked_note = f" blocked_by=[{blocked_by_str}]" if blocked_by_str else ""
+        return f"Task #{task_id} created: {title}{blocked_note}"
+    except Exception as e:
+        return f"Error creating task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def assign_task(agent_name: str, task_id: int, assigned_to: str) -> str:
+    """Assign a task to an agent. Lead only.
+
+    agent_name: the lead agent making the assignment.
+    task_id: the task to assign.
+    assigned_to: the agent being assigned the task.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can assign tasks. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Verify assignee exists
+        cursor.execute("SELECT name FROM agents WHERE name = ?", (assigned_to,))
+        if not cursor.fetchone():
+            return f"BLOCKED: Agent '{assigned_to}' not registered."
+
+        # Verify task exists
+        cursor.execute("SELECT id, status FROM tasks WHERE id = ?", (task_id,))
+        task_row = cursor.fetchone()
+        if not task_row:
+            return f"Task #{task_id} not found."
+
+        if task_row["status"] == "closed":
+            return f"BLOCKED: Task #{task_id} is closed."
+
+        cursor.execute(
+            "UPDATE tasks SET assigned_to = ?, status = 'assigned', updated_at = ? WHERE id = ?",
+            (assigned_to, now, task_id),
+        )
+        conn.commit()
+        return f"Task #{task_id} assigned to {assigned_to}. Status: assigned."
+    except Exception as e:
+        return f"Error assigning task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def update_task(
+    agent_name: str,
+    task_id: int,
+    status: str = "",
+    progress: str = "",
+    files: str = "",
+) -> str:
+    """Update a task's status, progress, or files. Auto-increments activity_count.
+
+    agent_name: who is updating.
+    task_id: the task to update.
+    status: new status (optional). Cannot set to 'closed' — use close_task instead.
+    progress: free-text progress note (optional).
+    files: comma-separated list of files being worked on (optional).
+    """
+    if status and status not in TASK_STATUSES:
+        return (
+            f"Invalid status '{status}'. "
+            f"Valid: {', '.join(sorted(TASK_STATUSES))}"
+        )
+
+    if status == "closed":
+        return "BLOCKED: Cannot set status to 'closed' via update_task. Use close_task instead."
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify agent exists
+        cursor.execute("SELECT name FROM agents WHERE name = ?", (agent_name,))
+        if not cursor.fetchone():
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+
+        # Verify task exists
+        cursor.execute(
+            "SELECT id, status, activity_count, title FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        task_row = cursor.fetchone()
+        if not task_row:
+            return f"Task #{task_id} not found."
+
+        if task_row["status"] == "closed":
+            return f"BLOCKED: Task #{task_id} is closed. No further updates allowed."
+
+        # Build dynamic UPDATE
+        fields = ["activity_count = activity_count + 1", "updated_at = ?"]
+        params: list[str | int] = [now]
+
+        if status:
+            fields.append("status = ?")
+            params.append(status)
+
+        if progress:
+            fields.append("progress = ?")
+            params.append(progress)
+
+        if files:
+            fields.append("files = ?")
+            params.append(files)
+
+        params.append(task_id)
+        cursor.execute(
+            f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+
+        # Read back activity_count
+        cursor.execute("SELECT activity_count FROM tasks WHERE id = ?", (task_id,))
+        new_count = cursor.fetchone()["activity_count"]
+
+        # Update agent last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+
+        parts = [f"Task #{task_id} updated by {agent_name}."]
+        if status:
+            parts.append(f"Status: {status}.")
+        if progress:
+            parts.append(f"Progress: {progress[:80]}{'...' if len(progress) > 80 else ''}")
+        parts.append(f"Activity count: {new_count}.")
+
+        if new_count >= 4:
+            parts.append(
+                f"WARNING: Activity count at {new_count} — this fight is dragging. "
+                f"Consider reassessing approach or asking lead for help."
+            )
+
+        return " ".join(parts)
+    except Exception as e:
+        return f"Error updating task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_tasks(
+    status: str = "",
+    project: str = "",
+    zone: str = "",
+    assigned_to: str = "",
+    count: int = 50,
+) -> str:
+    """List tasks. Defaults to open/assigned/in_progress if no status filter given.
+
+    status: filter by status (e.g. 'closed', 'stale'). Empty = active tasks only.
+    project: filter by project name.
+    zone: filter by zone.
+    assigned_to: filter by assigned agent.
+    count: max tasks to return (default 50).
+    """
+    if status and status not in TASK_STATUSES:
+        return (
+            f"Invalid status '{status}'. "
+            f"Valid: {', '.join(sorted(TASK_STATUSES))}"
+        )
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params: list[str | int] = []
+
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        else:
+            # Default: active tasks only
+            query += " AND status IN ('open', 'assigned', 'in_progress')"
+
+        if project:
+            query += " AND project = ?"
+            params.append(project)
+
+        if zone:
+            query += " AND zone = ?"
+            params.append(zone)
+
+        if assigned_to:
+            query += " AND assigned_to = ?"
+            params.append(assigned_to)
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(count)
+
+        cursor.execute(query, params)
+        tasks = [dict(row) for row in cursor.fetchall()]
+
+        if not tasks:
+            filter_desc = []
+            if status:
+                filter_desc.append(f"status={status}")
+            else:
+                filter_desc.append("status=open/assigned/in_progress")
+            if project:
+                filter_desc.append(f"project={project}")
+            if zone:
+                filter_desc.append(f"zone={zone}")
+            if assigned_to:
+                filter_desc.append(f"assigned_to={assigned_to}")
+            desc = f" ({', '.join(filter_desc)})" if filter_desc else ""
+            return f"No tasks found{desc}."
+
+        return json.dumps(tasks, indent=2)
+    except Exception as e:
+        return f"Error listing tasks: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_task(task_id: int) -> str:
+    """Get full detail for a single task.
+
+    task_id: the task ID.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        row = cursor.fetchone()
+        if not row:
+            return f"Task #{task_id} not found."
+        return json.dumps(dict(row), indent=2)
+    except Exception as e:
+        return f"Error getting task: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def submit_result(agent_name: str, task_id: int, result_file: str) -> str:
+    """Submit a result file (battle journey) for a task. File must exist on disk.
+
+    agent_name: who is submitting.
+    task_id: the task this result belongs to.
+    result_file: path to the result/writeup file (must exist).
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify agent exists
+        cursor.execute("SELECT name FROM agents WHERE name = ?", (agent_name,))
+        if not cursor.fetchone():
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+
+        # Verify task exists
+        cursor.execute(
+            "SELECT id, status, title FROM tasks WHERE id = ?", (task_id,)
+        )
+        task_row = cursor.fetchone()
+        if not task_row:
+            return f"Task #{task_id} not found."
+
+        # Result file must exist on disk
+        if not os.path.exists(result_file):
+            return f"BLOCKED: Result file does not exist: {result_file}"
+
+        cursor.execute(
+            "UPDATE tasks SET result_file = ?, updated_at = ? WHERE id = ?",
+            (result_file, now, task_id),
+        )
+
+        # Update agent last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+        return f"Result submitted for task #{task_id}: {result_file}"
+    except Exception as e:
+        return f"Error submitting result: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def close_task(agent_name: str, task_id: int) -> str:
+    """Close a task. Lead only. Blocks if no result file has been submitted.
+
+    agent_name: the lead agent closing this task.
+    task_id: the task to close.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only enforcement
+        cursor.execute(
+            "SELECT agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return (
+                f"BLOCKED: Only lead-class agents can close tasks. "
+                f"'{agent_name}' is class '{row['agent_class']}'."
+            )
+
+        # Verify task exists
+        cursor.execute(
+            "SELECT id, status, result_file, title FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        task_row = cursor.fetchone()
+        if not task_row:
+            return f"Task #{task_id} not found."
+
+        if task_row["status"] == "closed":
+            return f"Task #{task_id} is already closed."
+
+        # Block without result file
+        if not task_row["result_file"]:
+            return (
+                f"BLOCKED: Task #{task_id} has no result file. "
+                f"Agent must call submit_result before lead can close."
+            )
+
+        cursor.execute(
+            "UPDATE tasks SET status = 'closed', updated_at = ? WHERE id = ?",
+            (now, task_id),
+        )
+        conn.commit()
+        return f"Task #{task_id} closed: {task_row['title']}"
+    except Exception as e:
+        return f"Error closing task: {e}"
     finally:
         conn.close()
 

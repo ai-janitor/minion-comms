@@ -287,6 +287,38 @@ Comms enforces model-to-role restrictions on registration. Agents declare their 
 
 Self-reported model can't be verified, but it's on record. If an agent lies about their model, the quality shows up in turn counts and result files — lead sees it in the data.
 
+### Transport Types
+
+Agents declare their transport on `register`:
+
+| Transport | How messages reach the agent | Who manages it |
+|---|---|---|
+| `terminal` | Agent runs `poll.sh` in background, polls own inbox | Agent (human in CLI) |
+| `daemon` | Swarm daemon watches DB, injects messages on wake | minion-swarm |
+
+Both are peers on the comms network — same `send()`, same enforcement. The only difference is message delivery plumbing.
+
+**Hybrid model:** A raid typically has both. Human opens terminal sessions for high-value agents (lead, oracle, complex coder). Cheap grunt work (recon, builds, simple tasks) goes to swarm daemons. All talk through the same minion-comms DB.
+
+```
+┌─ TERMINAL (interactive, human sees everything) ─────┐
+│ Terminal 1: lead (general/commander)                 │
+│ Terminal 2: oracle-auth                              │
+│ Terminal 3: coder-api                                │
+└──────────────────────────────────────────────────────┘
+              ↕ minion-comms (shared coordination DB)
+┌─ DAEMON (headless, fire-and-forget) ────────────────┐
+│ Swarm: recon-deps (haiku)                            │
+│ Swarm: builder-ci (haiku)                            │
+│ Swarm: coder-tests (sonnet)                          │
+└──────────────────────────────────────────────────────┘
+```
+
+Comms behavior by transport:
+- **`poll.sh` reminders** — only for `terminal` agents. Daemons don't need them.
+- **`who()` output** — shows transport type so lead knows which agents are interactive vs headless.
+- **Nag behavior** — terminal agents get reminded to poll. Daemon agents don't.
+
 ```
 user (the human)
 └── general (puppet — translates user intent into battle plans)
@@ -564,7 +596,7 @@ Dead-drop can only enforce what it owns — comms data in the DB. It does NOT pr
 - Battle plan — lead can't send tasks without an active plan
 
 **Server reminds (not enforced):** things we can't verify
-- poll.sh running — we remind on every send, but can't verify the process is actually poll.sh
+- poll.sh running — we remind terminal agents on every send (skip for daemon transport), but can't verify the process is actually poll.sh
 - Agents actually reading the files they claim
 - Coders following the spec
 - Builders actually running the tests
