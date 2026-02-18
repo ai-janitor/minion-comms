@@ -102,12 +102,23 @@ Human opens terminals for high-value agents they want eyes on. Cheap work goes t
 | **Lifecycle** | `cold_start`, `fenix_down`, `debrief`, `end_session` |
 | **Trigger Words** | `get_triggers`, `clear_moon_crash` |
 
+## Install
+
+```bash
+curl -sSL https://raw.githubusercontent.com/ai-janitor/minion-comms/main/scripts/install.sh | bash
+```
+
+This installs minion-comms via pipx, deploys onboarding docs to `~/.minion-comms/`, and configures MCP for Claude Code.
+
+Or install directly:
+
+```bash
+pipx install git+https://github.com/ai-janitor/minion-comms.git
+```
+
 ## Quick Start
 
 ```bash
-# Install
-pip install -e .
-
 # Run MCP server (stdio transport)
 minion-comms
 
@@ -123,7 +134,7 @@ minion-comms
 
 ## Status
 
-Server implementation complete (Phases 0-7). Docs & onboarding (Phase 8) in progress.
+Server implementation complete (Phases 0-8). One-liner install, onboarding docs, and MCP auto-config included.
 
 See [`docs/FRAMEWORK.md`](docs/FRAMEWORK.md) for the full design specification.
 See [`PLAN.md`](PLAN.md) for the implementation roadmap.
