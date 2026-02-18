@@ -73,19 +73,15 @@ info "Configuring MCP..."
 # Prefer `claude mcp add` (knows the correct config location and format).
 # Fall back to manual JSON edit of ~/.claude.json if claude CLI not available.
 if command -v claude &>/dev/null; then
-    if [ -f "${MCP_CONFIG}" ] && grep -q '"minion-comms"' "${MCP_CONFIG}" 2>/dev/null; then
-        info "minion-comms already configured — skipping"
-    else
-        claude mcp add --scope user minion-comms -- minion-comms 2>/dev/null \
-            && ok "Added minion-comms via claude mcp add" \
-            || warn "claude mcp add failed — adding manually"
-    fi
+    claude mcp add --scope user minion-comms -- minion-comms 2>/dev/null \
+        && ok "Configured minion-comms MCP (via claude mcp add)" \
+        || warn "claude mcp add failed — configure manually: claude mcp add --scope user minion-comms -- minion-comms"
 else
     info "claude CLI not found — configuring ${MCP_CONFIG} directly"
 
     add_mcp_entry() {
         local config="$1"
-        if [ -f "$config" ] && grep -q '"minion-comms"' "$config" 2>/dev/null; then
+        if [ -f "$config" ] && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); exit(0 if 'minion-comms' in d.get('mcpServers',{}) else 1)" "$config" 2>/dev/null; then
             info "minion-comms already in ${config} — skipping"
             return
         fi
