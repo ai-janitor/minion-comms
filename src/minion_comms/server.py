@@ -1,7 +1,7 @@
-"""minion-comms MCP server — Phase 0 + Phase 1 + Phase 2 + Phase 3.
+"""minion-comms MCP server — Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5.
 
 Multi-agent coordination: messages, registration, HP tracking, context freshness,
-battle plans, raid log, and task system.
+battle plans, raid log, task system, file safety, and monitoring/health.
 DB: ~/.minion-comms/messages.db (override with MINION_COMMS_DB_PATH)
 """
 
@@ -240,6 +240,26 @@ def init_db() -> None:
         )
     """)
 
+    # file_claims — Phase 4
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS file_claims (
+            file_path   TEXT PRIMARY KEY,
+            agent_name  TEXT NOT NULL,
+            claimed_at  TEXT NOT NULL
+        )
+    """)
+
+    # file_waitlist — Phase 4
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS file_waitlist (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path   TEXT NOT NULL,
+            agent_name  TEXT NOT NULL,
+            added_at    TEXT NOT NULL,
+            UNIQUE(file_path, agent_name)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -345,9 +365,40 @@ def deregister(agent_name: str) -> str:
         cursor.execute("SELECT name FROM agents WHERE name = ?", (agent_name,))
         if not cursor.fetchone():
             return f"Agent '{agent_name}' not found."
+
+        # Phase 4: release all file claims held by this agent
+        cursor.execute(
+            "SELECT file_path FROM file_claims WHERE agent_name = ?",
+            (agent_name,),
+        )
+        claimed_files = [row["file_path"] for row in cursor.fetchall()]
+        waitlist_notes: list[str] = []
+        for fp in claimed_files:
+            cursor.execute(
+                "DELETE FROM file_claims WHERE file_path = ?", (fp,)
+            )
+            # Check waitlist for this file
+            cursor.execute(
+                "SELECT agent_name FROM file_waitlist WHERE file_path = ? ORDER BY added_at ASC LIMIT 1",
+                (fp,),
+            )
+            waiter = cursor.fetchone()
+            if waiter:
+                waitlist_notes.append(f"{fp} -> {waiter['agent_name']} waiting")
+        # Remove agent from any waitlists they were on
+        cursor.execute(
+            "DELETE FROM file_waitlist WHERE agent_name = ?", (agent_name,)
+        )
+
         cursor.execute("DELETE FROM agents WHERE name = ?", (agent_name,))
         conn.commit()
-        return f"Agent '{agent_name}' deregistered. Loot stays on disk."
+
+        result = f"Agent '{agent_name}' deregistered. Loot stays on disk."
+        if claimed_files:
+            result += f" Released {len(claimed_files)} file claim(s)."
+        if waitlist_notes:
+            result += f" Waitlisted agents to reassign: {'; '.join(waitlist_notes)}"
+        return result
     except Exception as e:
         return f"Error deregistering agent: {e}"
     finally:
@@ -1228,6 +1279,14 @@ def update_task(
                 f"Consider reassessing approach or asking lead for help."
             )
 
+        # Phase 5: staleness nag (warn but don't block — send() blocks)
+        _, stale_msg = _staleness_check(cursor, agent_name)
+        if stale_msg:
+            parts.append(
+                "WARNING: " + stale_msg.replace("BLOCKED: ", "")
+                + " Call set_context to update your metrics."
+            )
+
         return " ".join(parts)
     except Exception as e:
         return f"Error updating task: {e}"
@@ -1428,6 +1487,191 @@ def close_task(agent_name: str, task_id: int) -> str:
         return f"Task #{task_id} closed: {task_row['title']}"
     except Exception as e:
         return f"Error closing task: {e}"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — File Safety tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def claim_file(agent_name: str, file_path: str) -> str:
+    """Claim a file for exclusive editing. Prevents friendly fire (two agents editing the same file).
+
+    If the file is already claimed by another agent, you are auto-added to the
+    waitlist and the call returns BLOCKED. You will be notified when the file
+    is released.
+
+    agent_name: who is claiming the file.
+    file_path: path to the file to claim. Will be normalized to absolute path.
+    """
+    normalized = os.path.abspath(file_path)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify agent exists
+        cursor.execute("SELECT name FROM agents WHERE name = ?", (agent_name,))
+        if not cursor.fetchone():
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+
+        # Check if already claimed
+        cursor.execute(
+            "SELECT agent_name, claimed_at FROM file_claims WHERE file_path = ?",
+            (normalized,),
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            if existing["agent_name"] == agent_name:
+                return f"File already claimed by you: {normalized}"
+
+            # Auto-add to waitlist
+            cursor.execute(
+                """INSERT OR IGNORE INTO file_waitlist (file_path, agent_name, added_at)
+                   VALUES (?, ?, ?)""",
+                (normalized, agent_name, now),
+            )
+            conn.commit()
+            return (
+                f"BLOCKED: File '{normalized}' is claimed by '{existing['agent_name']}' "
+                f"(since {existing['claimed_at']}). "
+                f"You have been added to the waitlist."
+            )
+
+        # Claim the file
+        cursor.execute(
+            "INSERT INTO file_claims (file_path, agent_name, claimed_at) VALUES (?, ?, ?)",
+            (normalized, agent_name, now),
+        )
+
+        # Update last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+        return f"File claimed: {normalized} -> {agent_name}"
+    except Exception as e:
+        return f"Error claiming file: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def release_file(agent_name: str, file_path: str, force: bool = False) -> str:
+    """Release a file claim. Auto-notifies waitlisted agents.
+
+    agent_name: who is releasing. Lead can force-release any agent's claim.
+    file_path: path to the file to release. Will be normalized to absolute path.
+    force: if True, lead can release another agent's claim.
+    """
+    normalized = os.path.abspath(file_path)
+
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Verify agent exists
+        cursor.execute(
+            "SELECT name, agent_class FROM agents WHERE name = ?", (agent_name,)
+        )
+        agent_row = cursor.fetchone()
+        if not agent_row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+
+        # Check if file is claimed
+        cursor.execute(
+            "SELECT agent_name FROM file_claims WHERE file_path = ?",
+            (normalized,),
+        )
+        claim = cursor.fetchone()
+        if not claim:
+            return f"File '{normalized}' is not claimed by anyone."
+
+        claim_holder = claim["agent_name"]
+
+        # Permission check: only the holder or lead (with force) can release
+        if claim_holder != agent_name:
+            if agent_row["agent_class"] != "lead" or not force:
+                return (
+                    f"BLOCKED: File '{normalized}' is claimed by '{claim_holder}'. "
+                    f"Only the holder or lead (with force=True) can release it."
+                )
+
+        # Release the claim
+        cursor.execute(
+            "DELETE FROM file_claims WHERE file_path = ?", (normalized,)
+        )
+
+        # Check waitlist
+        cursor.execute(
+            "SELECT agent_name FROM file_waitlist WHERE file_path = ? ORDER BY added_at ASC",
+            (normalized,),
+        )
+        waiters = [row["agent_name"] for row in cursor.fetchall()]
+
+        # Remove waitlist entries for this file
+        cursor.execute(
+            "DELETE FROM file_waitlist WHERE file_path = ?", (normalized,)
+        )
+
+        # Update last_seen
+        cursor.execute(
+            "UPDATE agents SET last_seen = ? WHERE name = ?", (now, agent_name)
+        )
+
+        conn.commit()
+
+        result = f"File released: {normalized} (was held by {claim_holder})"
+        if claim_holder != agent_name:
+            result += f" [force-released by {agent_name}]"
+        if waiters:
+            result += f". Waitlisted agents: {', '.join(waiters)} — lead should reassign."
+        return result
+    except Exception as e:
+        return f"Error releasing file: {e}"
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_claims(agent_name: str = "") -> str:
+    """List all active file claims, optionally filtered by agent.
+
+    agent_name: filter to claims held by this agent. Empty = all claims.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        if agent_name:
+            cursor.execute(
+                "SELECT * FROM file_claims WHERE agent_name = ? ORDER BY claimed_at DESC",
+                (agent_name,),
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM file_claims ORDER BY agent_name, claimed_at DESC"
+            )
+        claims = [dict(row) for row in cursor.fetchall()]
+
+        # Also fetch waitlist info
+        cursor.execute(
+            "SELECT file_path, agent_name, added_at FROM file_waitlist ORDER BY added_at ASC"
+        )
+        waitlist = [dict(row) for row in cursor.fetchall()]
+
+        if not claims and not waitlist:
+            if agent_name:
+                return f"No file claims for agent '{agent_name}'."
+            return "No active file claims."
+
+        result_data = {"claims": claims, "waitlist": waitlist}
+        return json.dumps(result_data, indent=2)
+    except Exception as e:
+        return f"Error getting claims: {e}"
     finally:
         conn.close()
 
