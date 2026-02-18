@@ -38,10 +38,19 @@ else
     die "No Python package manager found. Install pipx: https://pipx.pypa.io"
 fi
 
-# Verify the command exists
+# Verify the command exists and PATH is set up
 if ! command -v minion-comms &>/dev/null; then
-    warn "minion-comms not found on PATH. You may need to add ~/.local/bin to your PATH."
-    warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    warn "minion-comms not found on PATH."
+    echo ""
+    warn "Add this to your shell config and restart your terminal:"
+    if [[ "${SHELL:-}" == */zsh ]]; then
+        warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+    elif [[ "${SHELL:-}" == */bash ]]; then
+        warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+    else
+        warn "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.profile"
+    fi
+    echo ""
 fi
 
 # ── Step 2: Deploy runtime docs to ~/.minion-comms/ ─────────────────────────
