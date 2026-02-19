@@ -78,7 +78,7 @@ TRIGGER_WORDS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=1)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
@@ -2553,52 +2553,107 @@ def _find_crew_file(crew_name: str) -> str | None:
     return None
 
 
+@mcp.tool()
+def list_crews() -> str:
+    """List available crews and their agents.
+
+    Returns all crew YAML files found in search paths with their
+    agent names and roles.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return "BLOCKED: PyYAML required. pip install pyyaml"
+
+    seen = set()
+    lines = []
+    for d in CREW_SEARCH_PATHS:
+        if not os.path.isdir(d):
+            continue
+        for fname in sorted(os.listdir(d)):
+            if not fname.endswith(".yaml"):
+                continue
+            crew_name = fname.replace(".yaml", "")
+            if crew_name in seen:
+                continue
+            seen.add(crew_name)
+            try:
+                with open(os.path.join(d, fname)) as f:
+                    cfg = yaml.safe_load(f)
+                lead = cfg.get("lead", {}).get("name", "?")
+                agents_cfg = cfg.get("agents", {})
+                members = " ".join(f"{n}:{c.get('role','?')}" for n, c in agents_cfg.items())
+                lines.append(f"{crew_name}: lead={lead} | {members}")
+            except Exception:
+                lines.append(f"{crew_name}: error")
+
+    if not lines:
+        return "No crews found."
+    return "\n".join(lines)
+
+
+
+
 def _spawn_tmux_workers(
     crew_name: str, agents: list[str], crew_config: str, project_dir: str,
 ) -> str:
-    """Start daemons and create a tmux session with one pane per agent."""
+    """Start daemons and add tmux panes. Reuses existing session if present."""
     tmux_session = f"crew-{crew_name}"
 
-    # Kill existing tmux session if any
-    subprocess.run(["tmux", "kill-session", "-t", tmux_session],
-                   capture_output=True)
+    # Check if tmux session already exists
+    session_exists = subprocess.run(
+        ["tmux", "has-session", "-t", tmux_session],
+        capture_output=True,
+    ).returncode == 0
 
-    # Clear old logs
-    logs_dir = os.path.join(project_dir, ".minion-swarm", "logs")
-    if os.path.isdir(logs_dir):
-        for fname in os.listdir(logs_dir):
-            if fname.endswith(".log"):
-                open(os.path.join(logs_dir, fname), "w").close()
+    if not session_exists:
+        # Fresh session — clear old logs
+        logs_dir = os.path.join(project_dir, ".minion-swarm", "logs")
+        if os.path.isdir(logs_dir):
+            for fname in os.listdir(logs_dir):
+                if fname.endswith(".log"):
+                    open(os.path.join(logs_dir, fname), "w").close()
 
-    for i, agent in enumerate(agents):
-        # Start daemon
-        subprocess.run(
-            ["minion-swarm", "start", agent, "--config", crew_config],
-            cwd=project_dir, capture_output=True,
+    # Count existing panes (for labeling new ones)
+    existing_panes = 0
+    if session_exists:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-t", tmux_session],
+            capture_output=True, text=True,
         )
+        if result.returncode == 0:
+            existing_panes = len(result.stdout.strip().splitlines())
+
+    # Add panes for new agents
+    for i, agent in enumerate(agents):
         log_file = os.path.join(project_dir, ".minion-swarm", "logs", f"{agent}.log")
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        open(log_file, "a").close()
         pane_cmd = f"tail -f {log_file}"
 
-        if i == 0:
+        if not session_exists and i == 0:
             subprocess.run([
                 "tmux", "new-session", "-d",
                 "-s", tmux_session, "-n", agent,
                 "bash", "-c", pane_cmd,
             ], check=True)
+            session_exists = True
         else:
             subprocess.run([
                 "tmux", "split-window", "-t", tmux_session, "-v",
                 "bash", "-c", pane_cmd,
             ], check=True)
-            subprocess.run([
-                "tmux", "select-layout", "-t", tmux_session, "tiled",
-            ], capture_output=True)
 
-    # Label panes
-    for i, agent in enumerate(agents):
+        # Label this pane
+        pane_idx = existing_panes + i
         subprocess.run([
-            "tmux", "select-pane", "-t", f"{tmux_session}:{0}.{i}", "-T", agent,
+            "tmux", "select-pane", "-t", f"{tmux_session}:{0}.{pane_idx}", "-T", agent,
         ], capture_output=True)
+
+    # Re-tile all panes
+    subprocess.run([
+        "tmux", "select-layout", "-t", tmux_session, "tiled",
+    ], capture_output=True)
     subprocess.run([
         "tmux", "set-option", "-t", tmux_session, "pane-border-status", "top",
     ], capture_output=True)
@@ -2607,8 +2662,16 @@ def _spawn_tmux_workers(
         "pane-border-format", " #{pane_title} ",
     ], capture_output=True)
 
-    # Auto-open Terminal.app attached to the tmux session
-    _open_tmux_terminal(tmux_session)
+    # Open Terminal.app if not already attached
+    if existing_panes == 0:
+        _open_tmux_terminal(tmux_session)
+
+    # Start daemons
+    for agent in agents:
+        subprocess.run(
+            ["minion-swarm", "start", agent, "--config", crew_config],
+            cwd=project_dir, capture_output=True,
+        )
 
     return tmux_session
 
@@ -2676,15 +2739,16 @@ def _kill_all_crews() -> None:
 
 
 @mcp.tool()
-def spawn_party(agent_name: str, crew: str, project_dir: str = ".") -> str:
+def spawn_party(agent_name: str, crew: str, project_dir: str = ".", agents: str = "") -> str:
     """Spawn daemon workers in tmux panes. Lead only.
 
-    Starts all daemon agents defined in the crew YAML and opens a tmux
+    Starts daemon agents defined in the crew YAML and opens a tmux
     session with one pane per agent showing live logs.
 
     agent_name: the lead agent spawning the party.
     crew: crew name (e.g. 'ff1') — matches a YAML file in crew search paths.
     project_dir: project directory for the agents to work in.
+    agents: comma-separated agent names to spawn (e.g. 'whitemage,thief'). Empty = all agents.
     """
     conn = get_db()
     cursor = conn.cursor()
@@ -2740,24 +2804,80 @@ def spawn_party(agent_name: str, crew: str, project_dir: str = ".") -> str:
         capture_output=True,
     )
 
-    agents = list(crew_cfg.get("agents", {}).keys())
-    if not agents:
+    all_agents = list(crew_cfg.get("agents", {}).keys())
+    if not all_agents:
         return f"BLOCKED: No agents defined in crew '{crew}'."
+
+    selective = bool(agents)
+    if selective:
+        requested = [a.strip() for a in agents.split(",")]
+        unknown = [a for a in requested if a not in all_agents]
+        if unknown:
+            return f"BLOCKED: Unknown agents: {', '.join(unknown)}. Available: {', '.join(all_agents)}"
+        all_agents = requested
+
+    if not selective:
+        # Full crew spawn — kill existing crews to avoid API rate limit starvation
+        _kill_all_crews()
 
     # Clear stand_down flag if set from a previous session
     conn = get_db()
     try:
         conn.execute("DELETE FROM flags WHERE key = 'stand_down'")
+        # Deconflict agent names against already-registered agents
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM agents")
+        registered = {row["name"] for row in cursor.fetchall()}
         conn.commit()
     finally:
         conn.close()
 
-    tmux_session = _spawn_tmux_workers(crew, agents, crew_config, project_dir)
+    # Rename colliding agents (thief → thief2, thief3, ...)
+    # and patch the crew config so the system prompt uses the new name
+    spawn_agents = []
+    renames = {}
+    for orig_name in all_agents:
+        name = orig_name
+        if name in registered:
+            n = 2
+            while f"{orig_name}{n}" in registered:
+                n += 1
+            name = f"{orig_name}{n}"
+            renames[orig_name] = name
+            # Clone the agent entry under the new name with patched system prompt
+            agent_cfg = crew_cfg["agents"][orig_name].copy()
+            if "system" in agent_cfg:
+                agent_cfg["system"] = agent_cfg["system"].replace(
+                    f'agent_name="{orig_name}"', f'agent_name="{name}"'
+                ).replace(
+                    f"You are {orig_name} ", f"You are {name} "
+                )
+            crew_cfg["agents"][name] = agent_cfg
+        spawn_agents.append(name)
+        registered.add(name)
+
+    # Write a runtime-only config with renames (never mutate the source YAML)
+    if renames:
+        import yaml
+        import tempfile
+        runtime_config = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", prefix=f"crew-{crew}-",
+            dir=os.path.dirname(crew_config), delete=False,
+        )
+        yaml.dump(crew_cfg, runtime_config, default_flow_style=False)
+        runtime_config.close()
+        crew_config = runtime_config.name
+
+    tmux_session = _spawn_tmux_workers(crew, spawn_agents, crew_config, project_dir)
+
+    rename_note = ""
+    if renames:
+        rename_note = "\n  Renamed: " + ", ".join(f"{k} → {v}" for k, v in renames.items())
 
     return (
-        f"Party spawned! {len(agents)} workers running.\n"
-        f"  Agents: {', '.join(agents)}\n"
-        f"  tmux session: {tmux_session}\n"
+        f"Party spawned! {len(spawn_agents)} workers running.\n"
+        f"  Agents: {', '.join(spawn_agents)}\n"
+        f"  tmux session: {tmux_session}{rename_note}\n"
         f"  View: tmux attach -t {tmux_session}\n"
         f"  Dismiss: stand_down(agent_name, crew) to stop all workers."
     )
