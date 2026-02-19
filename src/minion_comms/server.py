@@ -2532,6 +2532,7 @@ def clear_moon_crash(agent_name: str) -> str:
 
 CREW_SEARCH_PATHS = [
     os.path.expanduser("~/.minion-swarm/crews"),
+    os.path.expanduser("~/.minion-swarm"),
 ]
 
 # Try to find bundled crews from minion-swarm package
