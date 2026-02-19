@@ -727,10 +727,8 @@ def send(
                        value = '1', set_by = excluded.set_by, set_at = excluded.set_at""",
                 (from_agent, now),
             )
-            # Kill active crews (daemons + tmux panes)
-            for crew_name, crew_config in _active_crew.items():
-                _kill_crew(crew_name, crew_config)
-            _active_crew.clear()
+            # Kill all daemons + tmux panes
+            _kill_all_crews()
 
         conn.commit()
 
@@ -2611,20 +2609,30 @@ def _spawn_tmux_workers(
     return tmux_session
 
 
-def _kill_crew(crew_name: str, crew_config: str) -> None:
-    """Stop all daemons and kill the tmux session."""
-    subprocess.run(
-        ["minion-swarm", "stop", "--config", crew_config],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["tmux", "kill-session", "-t", f"crew-{crew_name}"],
-        capture_output=True,
-    )
+def _kill_all_crews() -> None:
+    """Stop all daemons and kill all crew tmux sessions."""
+    config_dir = os.path.expanduser("~/.minion-swarm")
+    if os.path.isdir(config_dir):
+        for fname in os.listdir(config_dir):
+            if fname.endswith(".yaml"):
+                config_path = os.path.join(config_dir, fname)
+                subprocess.run(
+                    ["minion-swarm", "stop", "--config", config_path],
+                    capture_output=True,
+                )
 
-
-# Track active crew for stand_down cleanup
-_active_crew: dict[str, str] = {}  # crew_name -> crew_config
+    # Kill all crew-* tmux sessions
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        for session in result.stdout.strip().splitlines():
+            if session.startswith("crew-"):
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", session],
+                    capture_output=True,
+                )
 
 
 @mcp.tool()
@@ -2705,15 +2713,66 @@ def spawn_party(agent_name: str, crew: str, project_dir: str = ".") -> str:
         conn.close()
 
     tmux_session = _spawn_tmux_workers(crew, agents, crew_config, project_dir)
-    _active_crew[crew] = crew_config
 
     return (
         f"Party spawned! {len(agents)} workers running.\n"
         f"  Agents: {', '.join(agents)}\n"
         f"  tmux session: {tmux_session}\n"
         f"  View: tmux attach -t {tmux_session}\n"
-        f"  Dismiss: broadcast 'stand_down' to stop all workers."
+        f"  Dismiss: stand_down(agent_name, crew) to stop all workers."
     )
+
+
+@mcp.tool()
+def stand_down(agent_name: str, crew: str = "") -> str:
+    """Dismiss the party — stop all daemon workers and close tmux panes. Lead only.
+
+    Sets the stand_down flag so poll.sh-based daemons also exit.
+    If crew is specified, only stops that crew. Otherwise stops all crews.
+
+    agent_name: the lead agent dismissing the party.
+    crew: crew name (e.g. 'ff1'). Empty = stop all crews.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    now = datetime.datetime.now().isoformat()
+    try:
+        # Lead-only check
+        cursor.execute("SELECT agent_class FROM agents WHERE name = ?", (agent_name,))
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return f"BLOCKED: Only lead-class agents can stand_down. '{agent_name}' is '{row['agent_class']}'."
+
+        # Set stand_down flag
+        cursor.execute(
+            """INSERT INTO flags (key, value, set_by, set_at)
+               VALUES ('stand_down', '1', ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value = '1', set_by = excluded.set_by, set_at = excluded.set_at""",
+            (agent_name, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if crew:
+        # Stop specific crew
+        config_path = os.path.expanduser(f"~/.minion-swarm/{crew}.yaml")
+        if os.path.isfile(config_path):
+            subprocess.run(
+                ["minion-swarm", "stop", "--config", config_path],
+                capture_output=True,
+            )
+        subprocess.run(
+            ["tmux", "kill-session", "-t", f"crew-{crew}"],
+            capture_output=True,
+        )
+        return f"Stand down: crew '{crew}' dismissed. Daemons stopped, tmux killed."
+    else:
+        _kill_all_crews()
+        return "Stand down: all crews dismissed. Daemons stopped, tmux killed."
 
 
 # ---------------------------------------------------------------------------
