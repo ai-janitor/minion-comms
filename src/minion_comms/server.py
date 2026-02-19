@@ -2606,11 +2606,48 @@ def _spawn_tmux_workers(
         "pane-border-format", " #{pane_title} ",
     ], capture_output=True)
 
+    # Auto-open Terminal.app attached to the tmux session
+    _open_tmux_terminal(tmux_session)
+
     return tmux_session
 
 
+def _open_tmux_terminal(tmux_session: str) -> None:
+    """Open a Terminal.app window attached to a tmux session."""
+    import platform
+    if platform.system() != "Darwin":
+        return
+    title = f"workers:{tmux_session}"
+    escaped_cmd = f"tmux attach -t {tmux_session}".replace('"', '\\"')
+    script = f'''
+    tell application "Terminal"
+        activate
+        do script "{escaped_cmd}"
+        set custom title of front window to "{title}"
+    end tell
+    '''
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
+def _close_terminal_by_title(title: str) -> None:
+    """Close Terminal.app windows matching a title pattern."""
+    import platform
+    if platform.system() != "Darwin":
+        return
+    script = f'''
+    tell application "Terminal"
+        repeat with w in windows
+            if custom title of w contains "{title}" then
+                close w saving no
+            end if
+        end repeat
+    end tell
+    '''
+    subprocess.run(["osascript", "-e", script], capture_output=True)
+
+
 def _kill_all_crews() -> None:
-    """Stop all daemons and kill all crew tmux sessions."""
+    """Stop all daemons, kill tmux sessions, close Terminal.app windows."""
     config_dir = os.path.expanduser("~/.minion-swarm")
     if os.path.isdir(config_dir):
         for fname in os.listdir(config_dir):
@@ -2629,6 +2666,8 @@ def _kill_all_crews() -> None:
     if result.returncode == 0:
         for session in result.stdout.strip().splitlines():
             if session.startswith("crew-"):
+                # Close the Terminal.app window first, then kill tmux
+                _close_terminal_by_title(f"workers:{session}")
                 subprocess.run(
                     ["tmux", "kill-session", "-t", session],
                     capture_output=True,
@@ -2765,11 +2804,12 @@ def stand_down(agent_name: str, crew: str = "") -> str:
                 ["minion-swarm", "stop", "--config", config_path],
                 capture_output=True,
             )
+        _close_terminal_by_title(f"workers:crew-{crew}")
         subprocess.run(
             ["tmux", "kill-session", "-t", f"crew-{crew}"],
             capture_output=True,
         )
-        return f"Stand down: crew '{crew}' dismissed. Daemons stopped, tmux killed."
+        return f"Stand down: crew '{crew}' dismissed."
     else:
         _kill_all_crews()
         return "Stand down: all crews dismissed. Daemons stopped, tmux killed."
