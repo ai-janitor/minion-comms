@@ -75,6 +75,13 @@ done
 
 ok "Onboarding docs deployed to ${RUNTIME_DIR}/"
 
+# Deploy poll.sh for daemon integration
+SCRIPTS_URL="https://raw.githubusercontent.com/ai-janitor/minion-comms/main/scripts"
+curl -sSfL "${SCRIPTS_URL}/poll.sh" -o "${RUNTIME_DIR}/poll.sh" \
+    && chmod +x "${RUNTIME_DIR}/poll.sh" \
+    && ok "poll.sh deployed to ${RUNTIME_DIR}/poll.sh" \
+    || warn "Failed to download poll.sh"
+
 # ── Step 3: Configure MCP for Claude Code ───────────────────────────────────
 
 info "Configuring MCP..."
