@@ -11,6 +11,8 @@ import sqlite3
 import datetime
 import os
 import json
+import shutil
+import subprocess
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -716,7 +718,7 @@ def send(
                 (from_agent, now),
             )
 
-        # stand_down: signal all daemons to exit gracefully
+        # stand_down: signal all daemons to exit gracefully + kill tmux
         if "stand_down" in triggers_found:
             cursor.execute(
                 """INSERT INTO flags (key, value, set_by, set_at)
@@ -725,6 +727,10 @@ def send(
                        value = '1', set_by = excluded.set_by, set_at = excluded.set_at""",
                 (from_agent, now),
             )
+            # Kill active crews (daemons + tmux panes)
+            for crew_name, crew_config in _active_crew.items():
+                _kill_crew(crew_name, crew_config)
+            _active_crew.clear()
 
         conn.commit()
 
@@ -2520,6 +2526,194 @@ def clear_moon_crash(agent_name: str) -> str:
         return f"Error clearing moon_crash: {e}"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Crew spawning — start daemon workers in tmux panes
+# ---------------------------------------------------------------------------
+
+CREW_SEARCH_PATHS = [
+    os.path.expanduser("~/.minion-swarm/crews"),
+]
+
+# Try to find bundled crews from minion-swarm package
+try:
+    import minion_swarm
+    _pkg_crews = os.path.join(os.path.dirname(minion_swarm.__file__), "data", "crews")
+    if os.path.isdir(_pkg_crews):
+        CREW_SEARCH_PATHS.insert(0, _pkg_crews)
+except ImportError:
+    pass
+
+
+def _find_crew_file(crew_name: str) -> str | None:
+    for d in CREW_SEARCH_PATHS:
+        candidate = os.path.join(d, f"{crew_name}.yaml")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _spawn_tmux_workers(
+    crew_name: str, agents: list[str], crew_config: str, project_dir: str,
+) -> str:
+    """Start daemons and create a tmux session with one pane per agent."""
+    tmux_session = f"crew-{crew_name}"
+
+    # Kill existing tmux session if any
+    subprocess.run(["tmux", "kill-session", "-t", tmux_session],
+                   capture_output=True)
+
+    # Clear old logs
+    logs_dir = os.path.join(project_dir, ".minion-swarm", "logs")
+    if os.path.isdir(logs_dir):
+        for fname in os.listdir(logs_dir):
+            if fname.endswith(".log"):
+                open(os.path.join(logs_dir, fname), "w").close()
+
+    for i, agent in enumerate(agents):
+        # Start daemon
+        subprocess.run(
+            ["minion-swarm", "start", agent, "--config", crew_config],
+            cwd=project_dir, capture_output=True,
+        )
+        log_file = os.path.join(project_dir, ".minion-swarm", "logs", f"{agent}.log")
+        pane_cmd = f"tail -f {log_file}"
+
+        if i == 0:
+            subprocess.run([
+                "tmux", "new-session", "-d",
+                "-s", tmux_session, "-n", agent,
+                "bash", "-c", pane_cmd,
+            ], check=True)
+        else:
+            subprocess.run([
+                "tmux", "split-window", "-t", tmux_session, "-v",
+                "bash", "-c", pane_cmd,
+            ], check=True)
+            subprocess.run([
+                "tmux", "select-layout", "-t", tmux_session, "tiled",
+            ], capture_output=True)
+
+    # Label panes
+    for i, agent in enumerate(agents):
+        subprocess.run([
+            "tmux", "select-pane", "-t", f"{tmux_session}:{0}.{i}", "-T", agent,
+        ], capture_output=True)
+    subprocess.run([
+        "tmux", "set-option", "-t", tmux_session, "pane-border-status", "top",
+    ], capture_output=True)
+    subprocess.run([
+        "tmux", "set-option", "-t", tmux_session,
+        "pane-border-format", " #{pane_title} ",
+    ], capture_output=True)
+
+    return tmux_session
+
+
+def _kill_crew(crew_name: str, crew_config: str) -> None:
+    """Stop all daemons and kill the tmux session."""
+    subprocess.run(
+        ["minion-swarm", "stop", "--config", crew_config],
+        capture_output=True,
+    )
+    subprocess.run(
+        ["tmux", "kill-session", "-t", f"crew-{crew_name}"],
+        capture_output=True,
+    )
+
+
+# Track active crew for stand_down cleanup
+_active_crew: dict[str, str] = {}  # crew_name -> crew_config
+
+
+@mcp.tool()
+def spawn_party(agent_name: str, crew: str, project_dir: str = ".") -> str:
+    """Spawn daemon workers in tmux panes. Lead only.
+
+    Starts all daemon agents defined in the crew YAML and opens a tmux
+    session with one pane per agent showing live logs.
+
+    agent_name: the lead agent spawning the party.
+    crew: crew name (e.g. 'ff1') — matches a YAML file in crew search paths.
+    project_dir: project directory for the agents to work in.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Lead-only check
+        cursor.execute("SELECT agent_class FROM agents WHERE name = ?", (agent_name,))
+        row = cursor.fetchone()
+        if not row:
+            return f"BLOCKED: Agent '{agent_name}' not registered."
+        if row["agent_class"] != "lead":
+            return f"BLOCKED: Only lead-class agents can spawn a party. '{agent_name}' is '{row['agent_class']}'."
+    finally:
+        conn.close()
+
+    if not shutil.which("tmux"):
+        return "BLOCKED: tmux is required. Install with: brew install tmux"
+    if not shutil.which("minion-swarm"):
+        return "BLOCKED: minion-swarm is required. Install from: https://github.com/ai-janitor/minion-swarm"
+
+    # Find crew file
+    crew_file = _find_crew_file(crew)
+    if not crew_file:
+        available = []
+        for d in CREW_SEARCH_PATHS:
+            if os.path.isdir(d):
+                available.extend(
+                    f.replace(".yaml", "") for f in os.listdir(d) if f.endswith(".yaml")
+                )
+        return f"BLOCKED: Crew '{crew}' not found. Available: {', '.join(sorted(set(available))) or 'none'}"
+
+    # Load and patch crew config
+    try:
+        import yaml
+    except ImportError:
+        return "BLOCKED: PyYAML required. pip install pyyaml"
+
+    with open(crew_file) as f:
+        crew_cfg = yaml.safe_load(f)
+
+    project_dir = os.path.abspath(project_dir)
+    crew_cfg["project_dir"] = project_dir
+
+    # Write patched config
+    config_dir = os.path.expanduser("~/.minion-swarm")
+    os.makedirs(config_dir, exist_ok=True)
+    crew_config = os.path.join(config_dir, f"{crew}.yaml")
+    with open(crew_config, "w") as f:
+        yaml.dump(crew_cfg, f, default_flow_style=False)
+
+    # Seed runtime dirs
+    subprocess.run(
+        ["minion-swarm", "init", "--config", crew_config, "--project-dir", project_dir],
+        capture_output=True,
+    )
+
+    agents = list(crew_cfg.get("agents", {}).keys())
+    if not agents:
+        return f"BLOCKED: No agents defined in crew '{crew}'."
+
+    # Clear stand_down flag if set from a previous session
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM flags WHERE key = 'stand_down'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    tmux_session = _spawn_tmux_workers(crew, agents, crew_config, project_dir)
+    _active_crew[crew] = crew_config
+
+    return (
+        f"Party spawned! {len(agents)} workers running.\n"
+        f"  Agents: {', '.join(agents)}\n"
+        f"  tmux session: {tmux_session}\n"
+        f"  View: tmux attach -t {tmux_session}\n"
+        f"  Dismiss: broadcast 'stand_down' to stop all workers."
+    )
 
 
 # ---------------------------------------------------------------------------
