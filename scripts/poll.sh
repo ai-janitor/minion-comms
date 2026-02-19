@@ -8,6 +8,7 @@ set -euo pipefail
 # Exits 0 when unread messages are found.
 # Exits 1 on timeout (if --timeout is set).
 # Exits 2 on usage error.
+# Exits 3 on stand_down (leader dismissed the party).
 #
 # Used by minion-swarm daemons to detect incoming work without
 # coupling to the minion-comms DB schema.
@@ -36,6 +37,16 @@ fi
 elapsed=0
 
 while true; do
+  # Check stand_down flag — leader dismissed the party
+  stand_down=$(sqlite3 "$DB_PATH" \
+    "SELECT value FROM flags WHERE key = 'stand_down';" \
+    2>/dev/null || echo 0)
+
+  if [[ "$stand_down" == "1" ]]; then
+    echo "stand_down"
+    exit 3
+  fi
+
   # Count unread direct messages
   direct=$(sqlite3 "$DB_PATH" \
     "SELECT COUNT(*) FROM messages WHERE to_agent = '${AGENT_NAME}' AND read_flag = 0;" \

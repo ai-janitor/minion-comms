@@ -716,6 +716,16 @@ def send(
                 (from_agent, now),
             )
 
+        # stand_down: signal all daemons to exit gracefully
+        if "stand_down" in triggers_found:
+            cursor.execute(
+                """INSERT INTO flags (key, value, set_by, set_at)
+                   VALUES ('stand_down', '1', ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = '1', set_by = excluded.set_by, set_at = excluded.set_at""",
+                (from_agent, now),
+            )
+
         conn.commit()
 
         cc_note = f" (cc: {', '.join(cc_agents)})" if cc_agents else ""
@@ -2462,6 +2472,7 @@ def get_triggers() -> str:
     result += "\n\nUsage: Include a trigger word in any send() message. "
     result += "Comms recognizes it automatically and tags the response."
     result += "\nSpecial: moon_crash auto-blocks all new task assignments."
+    result += "\nSpecial: stand_down signals all daemons to exit gracefully."
     return result
 
 
